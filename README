@@ -10,6 +10,26 @@ Load it with session_preload_libraries, shared_preload_libraries, or LOAD:
     LOAD 'auto_explain_z';
     SET auto_explain_z.log_min_duration = 0;
 
+Build and install it with PGXS:
+
+    make PG_CONFIG=/path/to/pg_config
+    make install PG_CONFIG=/path/to/pg_config
+
+Run TAP tests with PostgreSQL's installed PGXS harness when the target
+PostgreSQL build has TAP support enabled:
+
+    make installcheck PG_CONFIG=/path/to/pg_config
+
+For builds without --enable-tap-tests, the standalone Makefile provides a
+direct TAP runner. Point PG_TEST_PERL_DIR at the PostgreSQL source tree that
+matches the target server:
+
+    make tapcheck PG_CONFIG=/path/to/pg_config \
+        PG_TEST_PERL_DIR=/path/to/postgresql/src/test/perl
+
+tapcheck automatically includes Perl modules installed below ~/perl5. If
+dependencies such as IPC::Run are installed elsewhere, pass PERL5LIB as usual.
+
 Binary files are written per backend to auto_explain_z.directory, which
 defaults to auto_explain_z below the data directory. The "simple" profile is a
 compact binary plan tree with costs, optional execution stats, optional
