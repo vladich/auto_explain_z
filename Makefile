@@ -13,6 +13,7 @@ SCRIPTS = auto_explain_z_bench auto_explain_z_dump
 SHLIB_LINK += $(filter -llz4 -lzstd, $(LIBS))
 
 TAP_TESTS = 1
+EXTRA_CLEAN = __pycache__ log results
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

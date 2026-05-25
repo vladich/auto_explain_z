@@ -366,18 +366,30 @@ def get_sharedir(pg_config):
     return None
 
 
-def source_root(script):
+def extension_root(script):
+    return Path(script).resolve().parent
+
+
+def postgres_source_root(script, configured_root):
+    if configured_root:
+        root = Path(configured_root).resolve()
+        if not (root / "src" / "backend" / "postgres").exists():
+            raise BenchError(f"not a PostgreSQL source tree: {root}")
+        return root
+
     path = Path(script).resolve()
     if path.parent.name == "auto_explain_z" and path.parent.parent.name == "contrib":
         return path.parent.parent.parent
     return None
 
 
-def build_contrib(root):
-    if root is None:
-        raise BenchError("--build-contrib requires running from a PostgreSQL source tree")
-    run(["make", "-C", str(root / "contrib" / "auto_explain")], capture=False)
-    run(["make", "-C", str(root / "contrib" / "auto_explain_z")], capture=False)
+def build_contrib(pg_root, aez_root, pg_config):
+    if pg_root is None:
+        raise BenchError("--build-contrib requires --postgres-source for standalone runs")
+    run(["make", "-C", str(pg_root / "contrib" / "auto_explain")], capture=False)
+    env = os.environ.copy()
+    env["PG_CONFIG"] = pg_config
+    run(["make"], env=env, cwd=aez_root, capture=False)
 
 
 def source_tree_bindir(paths, work, root):
@@ -550,10 +562,11 @@ def parse_pgbench(output):
 
 
 class Cluster:
-    def __init__(self, args, paths, root):
+    def __init__(self, args, paths, pg_root, aez_root):
         self.args = args
         self.paths = paths
-        self.root = root
+        self.pg_root = pg_root
+        self.aez_root = aez_root
         self.pgdata = paths["work"] / "data"
         self.sockdir = paths["sock"]
         self.port = args.port or pick_port()
@@ -575,11 +588,14 @@ class Cluster:
 
     def dynamic_library_path(self):
         dirs = []
-        if self.root is not None:
-            dirs.append(str(self.root / "contrib" / "auto_explain"))
-            dirs.append(str(self.root / "contrib" / "auto_explain_z"))
+        if self.pg_root is not None:
+            dirs.append(str(self.pg_root / "contrib" / "auto_explain"))
+        if self.aez_root is not None:
+            dirs.append(str(self.aez_root))
         if self.args.dynamic_library_path:
             dirs.append(self.args.dynamic_library_path)
+        if dirs:
+            dirs.append("$libdir")
         return os.pathsep.join(dirs)
 
     def initdb(self):
@@ -1131,8 +1147,10 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="Benchmark auto_explain versus auto_explain_z using pgbench")
     parser.add_argument("--pg-config", default=shutil.which("pg_config") or "pg_config")
+    parser.add_argument("--postgres-source",
+                        help="PostgreSQL source tree for source-tree binaries and contrib/auto_explain")
     parser.add_argument("--build-contrib", action="store_true",
-                        help="run make in contrib/auto_explain and this auto_explain_z checkout first")
+                        help="build contrib/auto_explain from --postgres-source and this auto_explain_z checkout first")
     parser.add_argument("--workdir",
                         help="directory for the temporary cluster and logs")
     parser.add_argument("--keep", action="store_true",
@@ -1194,19 +1212,20 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    root = source_root(sys.argv[0])
+    aez_root = extension_root(sys.argv[0])
+    pg_root = postgres_source_root(sys.argv[0], args.postgres_source)
     if args.build_contrib:
-        build_contrib(root)
+        build_contrib(pg_root, aez_root, args.pg_config)
 
     bindir = get_bindir(args.pg_config)
     sharedir = get_sharedir(args.pg_config)
     source_bins = {}
-    if root is not None:
+    if pg_root is not None:
         source_bins = {
-            "postgres": [root / "src" / "backend" / "postgres"],
-            "initdb": [root / "src" / "bin" / "initdb" / "initdb"],
-            "psql": [root / "src" / "bin" / "psql" / "psql"],
-            "pgbench": [root / "src" / "bin" / "pgbench" / "pgbench"],
+            "postgres": [pg_root / "src" / "backend" / "postgres"],
+            "initdb": [pg_root / "src" / "bin" / "initdb" / "initdb"],
+            "psql": [pg_root / "src" / "bin" / "psql" / "psql"],
+            "pgbench": [pg_root / "src" / "bin" / "pgbench" / "pgbench"],
         }
     paths = {
         "postgres": find_bin("postgres", bindir, source_bins.get("postgres", [])),
@@ -1224,12 +1243,12 @@ def main(argv):
         cleanup = not args.keep
     paths["work"] = work
     paths["sock"] = Path(tempfile.mkdtemp(prefix="aezsock.", dir="/tmp")).resolve()
-    if root is not None and str(paths["initdb"]).startswith(str(root)):
-        paths.update(source_tree_bindir(paths, work, root))
-        paths["share"] = source_tree_sharedir(root, work, sharedir)
+    if pg_root is not None and str(paths["initdb"]).startswith(str(pg_root)):
+        paths.update(source_tree_bindir(paths, work, pg_root))
+        paths["share"] = source_tree_sharedir(pg_root, work, sharedir)
     paths["workload_scripts"] = write_custom_workload_scripts(work)
 
-    cluster = Cluster(args, paths, root)
+    cluster = Cluster(args, paths, pg_root, aez_root)
     results = []
     try:
         cluster.initdb()

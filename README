@@ -131,7 +131,8 @@ and other diagnostic fields preserved in the binary stream.
 
 Benchmark auto_explain_z against contrib/auto_explain with pgbench:
 
-    auto_explain_z_bench --build-contrib --scale 10 --clients 8 --duration 30 \
+    auto_explain_z_bench --postgres-source /path/to/postgresql --build-contrib \
+        --scale 10 --clients 8 --duration 30 \
         --iterations 3 --workloads select-only,simple-update,tpcb-like
 
     auto_explain_z_bench --scale 3 --clients 4 --duration 2 \
@@ -146,6 +147,9 @@ mean pgbench throughput/latency, throughput standard deviation, sampled server
 CPU percentage, regular-log bytes, binary-log bytes, and plan-log bytes per
 transaction. By default it uses pgbench's select-only workload and compares
 regular text auto_explain output against the simple auto_explain_z profile.
+When --postgres-source is provided, the benchmark can use source-tree binaries
+and build/load contrib/auto_explain from that tree while loading auto_explain_z
+from this standalone checkout.
 Built-in pgbench workloads are select-only, simple-update, and tpcb-like. The
 shape-* workloads create additional indexed lookup, range aggregate, join,
 complex CTE/aggregate, and very complex CTE/window/join plans.
