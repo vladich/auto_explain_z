@@ -315,6 +315,14 @@ WORKLOAD_OPTIONS = {
     **{name: [] for name in CUSTOM_WORKLOADS},
 }
 
+STANDARD_MATRIX = {
+    "workloads": "shape-simple-point,shape-complex,shape-very-complex,shape-node-suite",
+    "auto_explain_formats": "text,json",
+    "aez_profiles": "simple,full",
+    "compressions": "none,lz4,zstd",
+    "template_modes": "on,off",
+}
+
 
 def split_csv(value):
     return [v.strip() for v in value.split(",") if v.strip()]
@@ -1168,6 +1176,8 @@ def parse_args(argv):
     parser.add_argument("--workloads", default="select-only",
                         help="comma-separated workloads: {}".format(
                             ", ".join(sorted(WORKLOAD_OPTIONS))))
+    parser.add_argument("--standard-matrix", action="store_true",
+                        help="run the standard text/json, simple/full, compression, template, and shape matrix")
     parser.add_argument("--protocol", choices=("simple", "extended", "prepared"),
                         default="prepared")
     parser.add_argument("--aez-profiles", default="simple",
@@ -1210,8 +1220,20 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+def apply_standard_matrix(args):
+    if not args.standard_matrix:
+        return
+
+    args.workloads = STANDARD_MATRIX["workloads"]
+    args.auto_explain_formats = STANDARD_MATRIX["auto_explain_formats"]
+    args.aez_profiles = STANDARD_MATRIX["aez_profiles"]
+    args.compressions = STANDARD_MATRIX["compressions"]
+    args.template_modes = STANDARD_MATRIX["template_modes"]
+
+
 def main(argv):
     args = parse_args(argv)
+    apply_standard_matrix(args)
     aez_root = extension_root(sys.argv[0])
     pg_root = postgres_source_root(sys.argv[0], args.postgres_source)
     if args.build_contrib:

@@ -1,0 +1,4 @@
+comment = 'binary compressed execution plan logger'
+default_version = '1.0'
+module_pathname = 'auto_explain_z'
+relocatable = true

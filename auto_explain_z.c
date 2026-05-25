@@ -50,6 +50,8 @@
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
@@ -69,7 +71,7 @@ PG_MODULE_MAGIC_EXT(
 );
 
 #define AEZ_FILE_MAGIC			((uint32) 0x315a4541)	/* "AEZ1" */
-#define AEZ_FORMAT_VERSION		10
+#define AEZ_FORMAT_VERSION		12
 #define AEZ_FILE_HEADER_LEN		40
 #define AEZ_BYTES_TO_KILOBYTES(b) (((b) + 1023) / 1024)
 #define AEZ_DEFAULT_PENDING_BUFFER_SIZE_KB 1024
@@ -210,6 +212,17 @@ typedef enum AezDetailCode
 	AEZ_DETAIL_PLANNING_BUFFERS,
 	AEZ_DETAIL_CUSTOM_PLAN_PROVIDER,
 	AEZ_DETAIL_SINGLE_COPY,
+	AEZ_DETAIL_ALIAS,
+	AEZ_DETAIL_FUNCTION_NAME,
+	AEZ_DETAIL_TABLE_FUNCTION_NAME,
+	AEZ_DETAIL_CTE_NAME,
+	AEZ_DETAIL_TUPLESTORE_NAME,
+	AEZ_DETAIL_SAMPLING_METHOD,
+	AEZ_DETAIL_SAMPLING_PARAMETERS,
+	AEZ_DETAIL_REPEATABLE_SEED,
+	AEZ_DETAIL_SCHEMA,
+	AEZ_DETAIL_WINDOW,
+	AEZ_DETAIL_SUBPLAN_NAME,
 } AezDetailCode;
 
 typedef enum AezDetailType
@@ -232,6 +245,7 @@ typedef struct AezSerializeState
 	bool		verbose;
 	bool		analyze;
 	bool		deparse_ready;
+	const char *current_plan_name;
 } AezSerializeState;
 
 typedef struct AezTemplateKey
@@ -267,6 +281,19 @@ typedef struct AezQueryTemplateEntry
 	uint32		template_id;
 	uint32		plan_bytes;
 } AezQueryTemplateEntry;
+
+typedef struct AezSharedTemplateEntry
+{
+	AezTemplateKey key;
+	uint32		plan_bytes;
+} AezSharedTemplateEntry;
+
+typedef struct AezSharedState
+{
+	LWLock	   *lock;
+	uint32		max_templates;
+	uint32		template_count;
+} AezSharedState;
 
 typedef struct AezPlanningEntry
 {
@@ -350,6 +377,12 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static planner_hook_type prev_planner = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/* Shared template admission state, initialized only under shared_preload_libraries. */
+static AezSharedState *aez_shared = NULL;
+static HTAB *aez_shared_template_hash = NULL;
 
 /* Per-backend writer state. */
 static int	aez_fd = -1;
@@ -386,6 +419,7 @@ static HTAB *aez_query_template_hash = NULL;
 static HTAB *aez_planning_hash = NULL;
 static uint32 aez_template_count = 0;
 static uint32 aez_next_template_id = 1;
+static int	aez_proc_exit_registered_pid = 0;
 
 #ifdef USE_LZ4
 static LZ4F_compressionContext_t aez_lz4f_cctx = NULL;
@@ -406,6 +440,10 @@ static PlannedStmt *aez_planner(Query *parse, const char *query_string,
 								int cursorOptions,
 								ParamListInfo boundParams);
 
+static void aez_shmem_request(void);
+static void aez_shmem_startup(void);
+static Size aez_memsize(void);
+static void aez_ensure_proc_exit_registered(void);
 static void aez_proc_exit(int code, Datum arg);
 static bool aez_write_record(StringInfo record);
 static bool aez_file_preflight_needed(void);
@@ -447,7 +485,6 @@ static void aez_remember_planning_usage(PlannedStmt *plannedstmt,
 										BufferUsage *usage);
 static bool aez_take_planning_usage(PlannedStmt *plannedstmt,
 									BufferUsage *usage);
-static bool aez_buffer_usage_any(const BufferUsage *usage);
 static void aez_serialize_planning_buffers(StringInfo details,
 										   int *detail_count,
 										   BufferUsage *usage);
@@ -494,6 +531,8 @@ static uint64 aez_hash_bool(uint64 hash, bool value);
 static int64 aez_explain_time_microseconds(double seconds);
 static void aez_reset_templates(void);
 static void aez_invalidate_context_cache(void);
+static uint32 aez_template_runtime_cap(void);
+static bool aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes);
 static AezTemplateEntry *aez_find_template(AezTemplateKey *key);
 static AezTemplateEntry *aez_add_template(AezTemplateKey *key,
 										  uint32 plan_bytes);
@@ -541,7 +580,9 @@ static void aez_serialize_dynamic_node_details(StringInfo details,
 											   PlanState *planstate);
 static void aez_serialize_structural_node_details(StringInfo details,
 												  int *detail_count,
-												  PlanState *planstate);
+												  AezSerializeState *state,
+												  PlanState *planstate,
+												  List *ancestors);
 static void aez_serialize_runtime_node_details(StringInfo details,
 											   int *detail_count,
 											   AezSerializeState *state,
@@ -605,6 +646,23 @@ static void aez_serialize_extension_explain_text(StringInfo details,
 												 AezSerializeState *state,
 												 PlanState *planstate,
 												 List *ancestors);
+static const char *aez_scan_refname(AezSerializeState *state, Index rti);
+static void aez_detail_scan_target(StringInfo details, int *detail_count,
+								   AezSerializeState *state,
+								   Plan *plan);
+static void aez_detail_tablesample(StringInfo details, int *detail_count,
+								   AezSerializeState *state,
+								   PlanState *planstate,
+								   List *ancestors,
+								   TableSampleClause *tsc);
+static void aez_detail_window_def(StringInfo details, int *detail_count,
+								  AezSerializeState *state,
+								  WindowAggState *planstate,
+								  List *ancestors);
+static void aez_append_window_keys(StringInfo buf, AezSerializeState *state,
+								   PlanState *planstate,
+								   int nkeys, AttrNumber *keycols,
+								   List *ancestors);
 static bool aez_node_has_extension_explain(PlanState *planstate);
 static bool aez_plan_tree_has_extension_explain(PlanState *planstate);
 static bool aez_plan_members_have_extension_explain(PlanState **planstates,
@@ -790,7 +848,7 @@ _PG_init(void)
 							 NULL);
 
 	DefineCustomBoolVariable("auto_explain_z.template_cache",
-							 "Use a bounded per-backend plan template dictionary.",
+							 "Use a bounded plan template dictionary.",
 							 "When enabled, repeated plan shapes can be logged as template references plus per-execution metrics.",
 							 &auto_explain_z_template_cache,
 							 true,
@@ -847,8 +905,8 @@ _PG_init(void)
 							NULL);
 
 	DefineCustomIntVariable("auto_explain_z.max_templates",
-							"Maximum number of plan templates to keep per backend per binary log file.",
-							"Once the limit is reached, new plan shapes are written as full standalone records.",
+							"Maximum number of plan templates to admit.",
+							"When loaded through shared_preload_libraries this is a shared cap; once reached, new plan shapes are written as full standalone records.",
 							&auto_explain_z_max_templates,
 							4096,
 							0, INT_MAX,
@@ -1000,6 +1058,14 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	if (process_shared_preload_libraries_in_progress)
+	{
+		prev_shmem_request_hook = shmem_request_hook;
+		shmem_request_hook = aez_shmem_request;
+		prev_shmem_startup_hook = shmem_startup_hook;
+		shmem_startup_hook = aez_shmem_startup;
+	}
+
 	MarkGUCPrefixReserved("auto_explain_z");
 
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -1012,8 +1078,67 @@ _PG_init(void)
 	ExecutorEnd_hook = aez_ExecutorEnd;
 	prev_planner = planner_hook;
 	planner_hook = aez_planner;
+}
 
-	on_proc_exit(aez_proc_exit, 0);
+static void
+aez_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(aez_memsize());
+	RequestNamedLWLockTranche("auto_explain_z", 1);
+}
+
+static Size
+aez_memsize(void)
+{
+	Size		size;
+	long		max_entries;
+
+	max_entries = Max(auto_explain_z_max_templates, 1);
+	size = MAXALIGN(sizeof(AezSharedState));
+	size = add_size(size,
+					hash_estimate_size(max_entries,
+									   sizeof(AezSharedTemplateEntry)));
+	return size;
+}
+
+static void
+aez_shmem_startup(void)
+{
+	bool		found;
+	HASHCTL		ctl;
+	long		max_entries;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	aez_shared = NULL;
+	aez_shared_template_hash = NULL;
+	max_entries = Max(auto_explain_z_max_templates, 1);
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	aez_shared = ShmemInitStruct("auto_explain_z",
+								 sizeof(AezSharedState),
+								 &found);
+	if (!found)
+	{
+		aez_shared->lock = &(GetNamedLWLockTranche("auto_explain_z"))->lock;
+		aez_shared->max_templates = (uint32) Max(auto_explain_z_max_templates, 0);
+		aez_shared->template_count = 0;
+	}
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(AezTemplateKey);
+	ctl.entrysize = sizeof(AezSharedTemplateEntry);
+	aez_shared_template_hash =
+		ShmemInitHash("auto_explain_z template admission hash",
+					  max_entries, max_entries, &ctl,
+					  HASH_ELEM | HASH_BLOBS);
+
+	LWLockRelease(AddinShmemInitLock);
 }
 
 static void
@@ -1023,7 +1148,7 @@ aez_remember_planning_usage(PlannedStmt *plannedstmt, BufferUsage *usage)
 	AezPlanningEntry *entry;
 	bool		found;
 
-	if (plannedstmt == NULL || usage == NULL || !aez_buffer_usage_any(usage))
+	if (plannedstmt == NULL || usage == NULL)
 		return;
 
 	if (aez_planning_hash == NULL)
@@ -1062,27 +1187,6 @@ aez_take_planning_usage(PlannedStmt *plannedstmt, BufferUsage *usage)
 	*usage = entry->usage;
 	(void) hash_search(aez_planning_hash, &plannedstmt, HASH_REMOVE, NULL);
 	return true;
-}
-
-static bool
-aez_buffer_usage_any(const BufferUsage *usage)
-{
-	return usage->shared_blks_hit > 0 ||
-		usage->shared_blks_read > 0 ||
-		usage->shared_blks_dirtied > 0 ||
-		usage->shared_blks_written > 0 ||
-		usage->local_blks_hit > 0 ||
-		usage->local_blks_read > 0 ||
-		usage->local_blks_dirtied > 0 ||
-		usage->local_blks_written > 0 ||
-		usage->temp_blks_read > 0 ||
-		usage->temp_blks_written > 0 ||
-		!INSTR_TIME_IS_ZERO(usage->shared_blk_read_time) ||
-		!INSTR_TIME_IS_ZERO(usage->shared_blk_write_time) ||
-		!INSTR_TIME_IS_ZERO(usage->local_blk_read_time) ||
-		!INSTR_TIME_IS_ZERO(usage->local_blk_write_time) ||
-		!INSTR_TIME_IS_ZERO(usage->temp_blk_read_time) ||
-		!INSTR_TIME_IS_ZERO(usage->temp_blk_write_time);
 }
 
 static PlannedStmt *
@@ -1285,6 +1389,16 @@ logged:
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+static void
+aez_ensure_proc_exit_registered(void)
+{
+	if (aez_proc_exit_registered_pid == MyProcPid)
+		return;
+
+	on_proc_exit(aez_proc_exit, 0);
+	aez_proc_exit_registered_pid = MyProcPid;
 }
 
 static void
@@ -1527,13 +1641,16 @@ aez_build_payload(StringInfo buf, QueryDesc *queryDesc,
 		aez_serialize_plan_node(&planbuf, &state, queryDesc->planstate,
 								AEZ_PLAN_REL_ROOT, NIL);
 
-		if (shape_hash != 0 &&
+		if (auto_explain_z_template_cache &&
+			auto_explain_z_max_templates > 0 &&
+			query_id != 0 &&
+			shape_hash != 0 &&
 			template_entry == NULL &&
 			planbuf.len >= auto_explain_z_template_min_plan_bytes)
 		{
-			template_entry = aez_add_template(&template_key,
-											  (uint32) planbuf.len);
-			if (template_entry)
+				template_entry = aez_add_template(&template_key,
+												  (uint32) planbuf.len);
+				if (template_entry)
 				{
 					template_mode = AEZ_TEMPLATE_DEFINE;
 					template_id = template_entry->template_id;
@@ -1541,7 +1658,7 @@ aez_build_payload(StringInfo buf, QueryDesc *queryDesc,
 												template_entry);
 				}
 			}
-	}
+		}
 
 	if (aez_query_may_have_details(queryDesc, flags, planning_usage))
 	{
@@ -1794,8 +1911,7 @@ aez_query_may_have_details(QueryDesc *queryDesc, uint32 payload_flags,
 		return false;
 
 	if ((payload_flags & AEZ_QUERY_FLAG_BUFFERS) != 0 &&
-		planning_usage != NULL &&
-		aez_buffer_usage_any(planning_usage))
+		planning_usage != NULL)
 		return true;
 
 	if (estate->es_jit_flags & PGJIT_PERFORM)
@@ -2009,8 +2125,7 @@ aez_serialize_query_details(StringInfo buf, QueryDesc *queryDesc,
 
 	initStringInfo(&details);
 	if ((payload_flags & AEZ_QUERY_FLAG_BUFFERS) != 0 &&
-		planning_usage != NULL &&
-		aez_buffer_usage_any(planning_usage))
+		planning_usage != NULL)
 		aez_serialize_planning_buffers(&details, &detail_count,
 									   planning_usage);
 	if (payload_flags & AEZ_QUERY_FLAG_ANALYZE)
@@ -2724,6 +2839,60 @@ aez_invalidate_context_cache(void)
 	}
 }
 
+static uint32
+aez_template_runtime_cap(void)
+{
+	uint32		cap;
+
+	if (auto_explain_z_max_templates <= 0)
+		return 0;
+
+	cap = (uint32) auto_explain_z_max_templates;
+	if (aez_shared && aez_shared->max_templates < cap)
+		cap = aez_shared->max_templates;
+	return cap;
+}
+
+static bool
+aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes)
+{
+	AezSharedTemplateEntry *entry;
+	bool		found;
+	bool		admitted = false;
+	uint32		cap;
+
+	if (aez_shared == NULL || aez_shared_template_hash == NULL)
+		return true;
+
+	cap = aez_template_runtime_cap();
+	if (cap == 0)
+		return false;
+
+	LWLockAcquire(aez_shared->lock, LW_EXCLUSIVE);
+	entry = (AezSharedTemplateEntry *) hash_search(aez_shared_template_hash,
+												  key, HASH_FIND, &found);
+	if (found)
+	{
+		if (entry->plan_bytes < plan_bytes)
+			entry->plan_bytes = plan_bytes;
+		admitted = true;
+	}
+	else if (aez_shared->template_count < cap)
+	{
+		entry = (AezSharedTemplateEntry *) hash_search(aez_shared_template_hash,
+													  key, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->plan_bytes = plan_bytes;
+			aez_shared->template_count++;
+		}
+		admitted = true;
+	}
+	LWLockRelease(aez_shared->lock);
+
+	return admitted;
+}
+
 static AezTemplateEntry *
 aez_find_template(AezTemplateKey *key)
 {
@@ -2740,8 +2909,12 @@ aez_add_template(AezTemplateKey *key, uint32 plan_bytes)
 	HASHCTL		ctl;
 	AezTemplateEntry *entry;
 	bool		found;
+	uint32		cap;
 
-	if (aez_template_count >= (uint32) auto_explain_z_max_templates)
+	cap = aez_template_runtime_cap();
+	if (cap == 0 || aez_template_count >= cap)
+		return NULL;
+	if (!aez_shared_template_admit(key, plan_bytes))
 		return NULL;
 
 	if (aez_template_hash == NULL)
@@ -2751,7 +2924,7 @@ aez_add_template(AezTemplateKey *key, uint32 plan_bytes)
 		ctl.entrysize = sizeof(AezTemplateEntry);
 		ctl.hcxt = TopMemoryContext;
 		aez_template_hash = hash_create("auto_explain_z plan templates",
-										auto_explain_z_max_templates,
+										cap,
 										&ctl,
 										HASH_ELEM | HASH_BLOBS |
 										HASH_CONTEXT);
@@ -2886,6 +3059,8 @@ aez_open_file(uint64 needed)
 	off_t		pos;
 	int			wanted_compression;
 	bool		settings_changed = false;
+
+	aez_ensure_proc_exit_registered();
 
 	if (aez_writer_failed)
 		return false;
@@ -3623,6 +3798,7 @@ aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 						List *ancestors)
 {
 	Plan	   *plan = planstate->plan;
+	const char *plan_name = state->current_plan_name;
 	uint16		node_flags = 0;
 	uint8		extra_kind = 0;
 	uint32		extra1 = 0;
@@ -3768,11 +3944,15 @@ aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 	if (auto_explain_z_profile == AEZ_PROFILE_FULL)
 		aez_serialize_node_details(&details, &detail_count, state, planstate,
 								   ancestors);
-	aez_serialize_structural_node_details(&details, &detail_count, planstate);
+	aez_serialize_structural_node_details(&details, &detail_count, state,
+										  planstate, ancestors);
 	aez_serialize_extension_explain_text(&details, &detail_count, state,
 										 planstate, ancestors);
 	aez_put_u16(buf, (uint16) detail_count);
 	appendBinaryStringInfo(buf, details.data, details.len);
+
+	if (plan_name != NULL)
+		state->current_plan_name = NULL;
 
 	aez_put_uint_sized(buf, (uint64) child_count, child_count_code);
 	aez_serialize_plan_children(buf, state, planstate, ancestors);
@@ -3913,9 +4093,12 @@ aez_serialize_subplans(StringInfo buf, AezSerializeState *state, List *plans,
 	foreach(lc, plans)
 	{
 		SubPlanState *sps = lfirst_node(SubPlanState, lc);
+		const char *save_plan_name = state->current_plan_name;
 
+		state->current_plan_name = sps->subplan->plan_name;
 		aez_serialize_plan_node(buf, state, sps->planstate, relationship,
 								ancestors);
+		state->current_plan_name = save_plan_name;
 	}
 }
 
@@ -3952,7 +4135,8 @@ aez_append_plan_identity(StringInfo buf, AezSerializeState *state, Plan *plan)
 
 				rte = rt_fetch(((Scan *) plan)->scanrelid,
 							   state->rtable);
-				aliasname = rte->eref ? rte->eref->aliasname : NULL;
+				aliasname = aez_scan_refname(state,
+											 ((Scan *) plan)->scanrelid);
 				if (rte->rtekind == RTE_RELATION)
 				{
 					relid = rte->relid;
@@ -3986,7 +4170,7 @@ aez_append_plan_identity(StringInfo buf, AezSerializeState *state, Plan *plan)
 				RangeTblEntry *rte;
 
 				rte = rt_fetch(rtindex, state->rtable);
-				aliasname = rte->eref ? rte->eref->aliasname : NULL;
+				aliasname = aez_scan_refname(state, rtindex);
 				if (rte->rtekind == RTE_RELATION)
 				{
 					relid = rte->relid;
@@ -4011,7 +4195,7 @@ scan_relation:
 
 		rte = rt_fetch(((Scan *) plan)->scanrelid,
 					   state->rtable);
-		aliasname = rte->eref ? rte->eref->aliasname : NULL;
+		aliasname = aez_scan_refname(state, ((Scan *) plan)->scanrelid);
 		if (rte->rtekind == RTE_RELATION)
 		{
 			relid = rte->relid;
@@ -4413,25 +4597,28 @@ aez_serialize_runtime_node_details(StringInfo details, int *detail_count,
 								 (HashState *) planstate);
 			break;
 		case T_Material:
-			aez_detail_storage_info(details, detail_count,
-									AEZ_DETAIL_STORAGE_INFO,
-									((MaterialState *) planstate)->tuplestorestate);
+			if (state->analyze)
+				aez_detail_storage_info(details, detail_count,
+										AEZ_DETAIL_STORAGE_INFO,
+										((MaterialState *) planstate)->tuplestorestate);
 			break;
 		case T_WindowAgg:
-			aez_detail_storage_info(details, detail_count,
-									AEZ_DETAIL_STORAGE_INFO,
-									((WindowAggState *) planstate)->buffer);
+			if (state->analyze)
+				aez_detail_storage_info(details, detail_count,
+										AEZ_DETAIL_STORAGE_INFO,
+										((WindowAggState *) planstate)->buffer);
 			break;
 		case T_CteScan:
-			if (((CteScanState *) planstate)->leader)
+			if (state->analyze && ((CteScanState *) planstate)->leader)
 				aez_detail_storage_info(details, detail_count,
 										AEZ_DETAIL_STORAGE_INFO,
 										((CteScanState *) planstate)->leader->cte_table);
 			break;
 		case T_TableFuncScan:
-			aez_detail_storage_info(details, detail_count,
-									AEZ_DETAIL_STORAGE_INFO,
-									((TableFuncScanState *) planstate)->tupstore);
+			if (state->analyze)
+				aez_detail_storage_info(details, detail_count,
+										AEZ_DETAIL_STORAGE_INFO,
+										((TableFuncScanState *) planstate)->tupstore);
 			break;
 		case T_RecursiveUnion:
 			if (state->analyze)
@@ -4470,18 +4657,14 @@ aez_serialize_runtime_node_details(StringInfo details, int *detail_count,
 									dynamic_only);
 			break;
 		case T_Append:
-			if (!dynamic_only &&
-				list_length(((Append *) plan)->appendplans) >
-				((AppendState *) planstate)->as_nplans)
+			if (!dynamic_only)
 				aez_detail_i64(details, detail_count,
 							   AEZ_DETAIL_SUBPLANS_REMOVED,
 							   list_length(((Append *) plan)->appendplans) -
 							   ((AppendState *) planstate)->as_nplans);
 			break;
 		case T_MergeAppend:
-			if (!dynamic_only &&
-				list_length(((MergeAppend *) plan)->mergeplans) >
-				((MergeAppendState *) planstate)->ms_nplans)
+			if (!dynamic_only)
 				aez_detail_i64(details, detail_count,
 							   AEZ_DETAIL_SUBPLANS_REMOVED,
 							   list_length(((MergeAppend *) plan)->mergeplans) -
@@ -4497,14 +4680,297 @@ aez_serialize_runtime_node_details(StringInfo details, int *detail_count,
 	}
 }
 
-static void
-aez_serialize_structural_node_details(StringInfo details, int *detail_count,
-									  PlanState *planstate)
+static const char *
+aez_scan_refname(AezSerializeState *state, Index rti)
 {
-	Plan	   *plan = planstate->plan;
+	RangeTblEntry *rte;
+	const char *refname = NULL;
+
+	if (rti == 0 || rti > list_length(state->rtable))
+		return NULL;
+
+	aez_init_deparse_state(state);
+	rte = rt_fetch(rti, state->rtable);
+	if (state->rtable_names != NIL)
+		refname = (const char *) list_nth(state->rtable_names, rti - 1);
+	if (refname == NULL && rte->eref != NULL)
+		refname = rte->eref->aliasname;
+	return refname;
+}
+
+static void
+aez_detail_scan_target(StringInfo details, int *detail_count,
+					   AezSerializeState *state, Plan *plan)
+{
+	Index		rti;
+	RangeTblEntry *rte;
+	const char *refname;
+	const char *objectname = NULL;
+	const char *namespace = NULL;
+	AezDetailCode objectcode = 0;
 
 	switch (nodeTag(plan))
 	{
+		case T_FunctionScan:
+		case T_TableFuncScan:
+		case T_CteScan:
+		case T_NamedTuplestoreScan:
+		case T_WorkTableScan:
+		case T_SubqueryScan:
+		case T_ValuesScan:
+			break;
+		default:
+			return;
+	}
+
+	rti = ((Scan *) plan)->scanrelid;
+	if (rti == 0 || rti > list_length(state->rtable))
+		return;
+
+	rte = rt_fetch(rti, state->rtable);
+	refname = aez_scan_refname(state, rti);
+
+	switch (nodeTag(plan))
+	{
+		case T_FunctionScan:
+			{
+				FunctionScan *fscan = (FunctionScan *) plan;
+
+				if (rte->rtekind != RTE_FUNCTION)
+					return;
+				if (list_length(fscan->functions) == 1)
+				{
+					RangeTblFunction *rtfunc =
+						(RangeTblFunction *) linitial(fscan->functions);
+
+					if (IsA(rtfunc->funcexpr, FuncExpr))
+					{
+						FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
+						Oid			funcid = funcexpr->funcid;
+
+						objectname = get_func_name(funcid);
+						if (state->verbose)
+							namespace =
+								get_namespace_name_or_temp(get_func_namespace(funcid));
+					}
+				}
+				objectcode = AEZ_DETAIL_FUNCTION_NAME;
+			}
+			break;
+		case T_TableFuncScan:
+			{
+				TableFunc  *tablefunc = ((TableFuncScan *) plan)->tablefunc;
+
+				if (rte->rtekind != RTE_TABLEFUNC || tablefunc == NULL)
+					return;
+				switch (tablefunc->functype)
+				{
+					case TFT_XMLTABLE:
+						objectname = "xmltable";
+						break;
+					case TFT_JSON_TABLE:
+						objectname = "json_table";
+						break;
+					default:
+						elog(ERROR, "invalid TableFunc type %d",
+							 (int) tablefunc->functype);
+				}
+				objectcode = AEZ_DETAIL_TABLE_FUNCTION_NAME;
+			}
+			break;
+		case T_CteScan:
+			if (rte->rtekind != RTE_CTE || rte->self_reference)
+				return;
+			objectname = rte->ctename;
+			objectcode = AEZ_DETAIL_CTE_NAME;
+			break;
+		case T_NamedTuplestoreScan:
+			if (rte->rtekind != RTE_NAMEDTUPLESTORE)
+				return;
+			objectname = rte->enrname;
+			objectcode = AEZ_DETAIL_TUPLESTORE_NAME;
+			break;
+		case T_WorkTableScan:
+			if (rte->rtekind != RTE_CTE || !rte->self_reference)
+				return;
+			objectname = rte->ctename;
+			objectcode = AEZ_DETAIL_CTE_NAME;
+			break;
+		case T_SubqueryScan:
+			if (rte->rtekind != RTE_SUBQUERY)
+				return;
+			break;
+		case T_ValuesScan:
+			if (rte->rtekind != RTE_VALUES)
+				return;
+			break;
+		default:
+			return;
+	}
+
+	if (objectcode != 0 && objectname != NULL)
+		aez_detail_string(details, detail_count, objectcode, objectname);
+	if (namespace != NULL)
+		aez_detail_string(details, detail_count, AEZ_DETAIL_SCHEMA, namespace);
+	if (refname != NULL)
+		aez_detail_string(details, detail_count, AEZ_DETAIL_ALIAS, refname);
+}
+
+static void
+aez_detail_tablesample(StringInfo details, int *detail_count,
+					   AezSerializeState *state,
+					   PlanState *planstate, List *ancestors,
+					   TableSampleClause *tsc)
+{
+	List	   *context;
+	List	   *params = NIL;
+	bool		useprefix;
+	char	   *method_name;
+	char	   *repeatable = NULL;
+	ListCell   *lc;
+
+	if (tsc == NULL)
+		return;
+
+	aez_init_deparse_state(state);
+	context = set_deparse_context_plan(state->deparse_cxt,
+									   planstate->plan,
+									   ancestors);
+	useprefix = state->rtable_size > 1;
+	method_name = get_func_name(tsc->tsmhandler);
+
+	foreach(lc, tsc->args)
+	{
+		Node	   *arg = (Node *) lfirst(lc);
+
+		params = lappend(params,
+						 deparse_expression(arg, context, useprefix, false));
+	}
+	if (tsc->repeatable)
+		repeatable = deparse_expression((Node *) tsc->repeatable, context,
+										useprefix, false);
+
+	if (method_name != NULL)
+		aez_detail_string(details, detail_count,
+						  AEZ_DETAIL_SAMPLING_METHOD, method_name);
+	aez_detail_string_list(details, detail_count,
+						   AEZ_DETAIL_SAMPLING_PARAMETERS, params);
+	if (repeatable != NULL)
+		aez_detail_string(details, detail_count,
+						  AEZ_DETAIL_REPEATABLE_SEED, repeatable);
+}
+
+static void
+aez_append_window_keys(StringInfo buf, AezSerializeState *state,
+					   PlanState *planstate,
+					   int nkeys, AttrNumber *keycols,
+					   List *ancestors)
+{
+	Plan	   *plan = planstate->plan;
+	List	   *context;
+	bool		useprefix;
+
+	context = set_deparse_context_plan(state->deparse_cxt, plan, ancestors);
+	useprefix = (state->rtable_size > 1 || state->verbose);
+
+	for (int keyno = 0; keyno < nkeys; keyno++)
+	{
+		AttrNumber	keyresno = keycols[keyno];
+		TargetEntry *target;
+		char	   *exprstr;
+
+		target = get_tle_by_resno(plan->targetlist, keyresno);
+		if (!target)
+			elog(ERROR, "no tlist entry for key %d", keyresno);
+
+		exprstr = deparse_expression((Node *) target->expr, context,
+									 useprefix, true);
+		if (keyno > 0)
+			appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, exprstr);
+	}
+}
+
+static void
+aez_detail_window_def(StringInfo details, int *detail_count,
+					  AezSerializeState *state,
+					  WindowAggState *planstate,
+					  List *ancestors)
+{
+	WindowAgg  *wagg = (WindowAgg *) planstate->ss.ps.plan;
+	StringInfoData wbuf;
+	bool		needspace = false;
+
+	aez_init_deparse_state(state);
+	initStringInfo(&wbuf);
+	appendStringInfo(&wbuf, "%s AS (", quote_identifier(wagg->winname));
+
+	ancestors = lcons(wagg, ancestors);
+	if (wagg->partNumCols > 0)
+	{
+		appendStringInfoString(&wbuf, "PARTITION BY ");
+		aez_append_window_keys(&wbuf, state, outerPlanState(planstate),
+							   wagg->partNumCols, wagg->partColIdx,
+							   ancestors);
+		needspace = true;
+	}
+	if (wagg->ordNumCols > 0)
+	{
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, "ORDER BY ");
+		aez_append_window_keys(&wbuf, state, outerPlanState(planstate),
+							   wagg->ordNumCols, wagg->ordColIdx,
+							   ancestors);
+		needspace = true;
+	}
+	ancestors = list_delete_first(ancestors);
+	if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
+	{
+		List	   *context;
+		bool		useprefix;
+		char	   *framestr;
+
+		context = set_deparse_context_plan(state->deparse_cxt,
+										   (Plan *) wagg,
+										   ancestors);
+		useprefix = (state->rtable_size > 1 || state->verbose);
+		framestr = get_window_frame_options_for_explain(wagg->frameOptions,
+														wagg->startOffset,
+														wagg->endOffset,
+														context,
+														useprefix);
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, framestr);
+	}
+	appendStringInfoChar(&wbuf, ')');
+	aez_detail_string(details, detail_count, AEZ_DETAIL_WINDOW, wbuf.data);
+}
+
+static void
+aez_serialize_structural_node_details(StringInfo details, int *detail_count,
+									  AezSerializeState *state,
+									  PlanState *planstate,
+									  List *ancestors)
+{
+	Plan	   *plan = planstate->plan;
+
+	if (state->current_plan_name != NULL)
+		aez_detail_string(details, detail_count,
+						  AEZ_DETAIL_SUBPLAN_NAME,
+						  state->current_plan_name);
+
+	aez_detail_scan_target(details, detail_count, state, plan);
+
+	switch (nodeTag(plan))
+	{
+		case T_SampleScan:
+			if (auto_explain_z_profile != AEZ_PROFILE_FULL)
+				aez_detail_tablesample(details, detail_count, state, planstate,
+									   ancestors,
+									   ((SampleScan *) plan)->tablesample);
+			break;
 		case T_CustomScan:
 			{
 				CustomScan *cscan = (CustomScan *) plan;
@@ -5385,6 +5851,10 @@ aez_serialize_node_details(StringInfo details, int *detail_count,
 			break;
 
 		case T_SampleScan:
+			aez_detail_tablesample(details, detail_count, state, planstate,
+								   ancestors,
+								   ((SampleScan *) plan)->tablesample);
+			/* FALLTHROUGH */
 		case T_SeqScan:
 		case T_ValuesScan:
 		case T_CteScan:
@@ -5435,14 +5905,6 @@ aez_serialize_node_details(StringInfo details, int *detail_count,
 				aez_detail_double(details, detail_count,
 								  AEZ_DETAIL_WORKERS_LAUNCHED,
 								  ((GatherMergeState *) planstate)->nworkers_launched);
-			aez_detail_sort_group_keys(details, detail_count, state,
-									   planstate, ancestors,
-									   AEZ_DETAIL_SORT_KEY,
-									   ((GatherMerge *) plan)->numCols, 0,
-									   ((GatherMerge *) plan)->sortColIdx,
-									   ((GatherMerge *) plan)->sortOperators,
-									   ((GatherMerge *) plan)->collations,
-									   ((GatherMerge *) plan)->nullsFirst);
 			break;
 
 		case T_FunctionScan:
@@ -5647,6 +6109,9 @@ aez_serialize_node_details(StringInfo details, int *detail_count,
 			break;
 
 		case T_WindowAgg:
+			aez_detail_window_def(details, detail_count, state,
+								  (WindowAggState *) planstate,
+								  ancestors);
 			aez_detail_qual(details, detail_count, state, planstate,
 							ancestors,
 							((WindowAgg *) plan)->runConditionOrig,

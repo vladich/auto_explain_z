@@ -139,6 +139,17 @@ DETAIL_LABELS = {
     47: "Planning",
     48: "Custom Plan Provider",
     49: "Single Copy",
+    50: "Alias",
+    51: "Function Name",
+    52: "Table Function Name",
+    53: "CTE Name",
+    54: "Tuplestore Name",
+    55: "Sampling Method",
+    56: "Sampling Parameters",
+    57: "Repeatable Seed",
+    58: "Schema",
+    59: "Window",
+    60: "Subplan Name",
 }
 
 RELATIONSHIP_NAMES = {
@@ -1187,9 +1198,33 @@ def add_scan_identity(out, node):
         out["Index Name"] = node["Index Name"]
     if node.get("Relation Name"):
         out["Relation Name"] = node["Relation Name"]
-    if node.get("Schema"):
-        out["Schema"] = node["Schema"]
-    if node.get("Alias"):
+        if node.get("Schema"):
+            out["Schema"] = node["Schema"]
+        if node.get("Alias"):
+            out["Alias"] = node["Alias"]
+    elif ntype == "Function Scan":
+        if node.get("Function Name"):
+            out["Function Name"] = node["Function Name"]
+        if node.get("Schema"):
+            out["Schema"] = node["Schema"]
+        if node.get("Alias"):
+            out["Alias"] = node["Alias"]
+    elif ntype == "Table Function Scan":
+        if node.get("Table Function Name"):
+            out["Table Function Name"] = node["Table Function Name"]
+        if node.get("Alias"):
+            out["Alias"] = node["Alias"]
+    elif ntype in ("CTE Scan", "WorkTable Scan"):
+        if node.get("CTE Name"):
+            out["CTE Name"] = node["CTE Name"]
+        if node.get("Alias"):
+            out["Alias"] = node["Alias"]
+    elif ntype == "Named Tuplestore Scan":
+        if node.get("Tuplestore Name"):
+            out["Tuplestore Name"] = node["Tuplestore Name"]
+        if node.get("Alias"):
+            out["Alias"] = node["Alias"]
+    elif ntype in ("Subquery Scan", "Values Scan") and node.get("Alias"):
         out["Alias"] = node["Alias"]
 
 
@@ -1394,6 +1429,8 @@ def postgres_plan_node(node, record_flags=0):
     relationship = node.get("Relationship")
     if relationship:
         out["Parent Relationship"] = relationship
+    if node.get("Subplan Name"):
+        out["Subplan Name"] = node["Subplan Name"]
     if "Custom Plan Provider" in node:
         out["Custom Plan Provider"] = node["Custom Plan Provider"]
     out["Parallel Aware"] = bool(flags & NODE_PARALLEL_AWARE)
@@ -1425,7 +1462,8 @@ def postgres_plan_node(node, record_flags=0):
         "Total Time", "Actual Rows", "Actual Loops", "Never Executed",
         "Buffers", "WAL", "Relation OID", "Index OID", "Relation Name",
         "Schema", "Alias", "Index Name", "Plans", "Extra Kind", "Extra1",
-        "Extra2", "Inner Unique", "Custom Plan Provider",
+        "Extra2", "Inner Unique", "Custom Plan Provider", "Function Name",
+        "Table Function Name", "CTE Name", "Tuplestore Name", "Subplan Name",
     }
     for key, value in node.items():
         if key not in skip:
@@ -1451,10 +1489,17 @@ def postgres_plan_node(node, record_flags=0):
             else:
                 out[key] = postgres_detail_value(key, value)
 
+    subplans_removed = out.pop("Subplans Removed", None)
+    workers = out.pop("Workers", None)
+
     if node.get("Buffers"):
         add_buffer_properties(out, node["Buffers"])
     if node.get("WAL"):
         add_wal_properties(out, node["WAL"])
+    if subplans_removed is not None:
+        out["Subplans Removed"] = subplans_removed
+    if workers is not None:
+        out["Workers"] = workers
 
     if ((record_flags & FLAG_ANALYZE) and
             ("Actual Loops" in node) and
@@ -1502,6 +1547,33 @@ def postgres_records(records):
     return [postgres_record(r) for r in records]
 
 
+RESERVED_IDENTIFIERS = {
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
+    "asymmetric", "both", "case", "cast", "check", "collate", "column",
+    "constraint", "create", "current_catalog", "current_date",
+    "current_role", "current_time", "current_timestamp", "current_user",
+    "default", "deferrable", "desc", "distinct", "do", "else", "end",
+    "except", "false", "fetch", "for", "foreign", "from", "grant",
+    "group", "having", "in", "initially", "intersect", "into", "lateral",
+    "leading", "limit", "localtime", "localtimestamp", "not", "null",
+    "offset", "on", "only", "or", "order", "placing", "primary",
+    "references", "returning", "select", "session_user", "some",
+    "symmetric", "table", "then", "to", "trailing", "true", "union",
+    "unique", "user", "using", "variadic", "when", "where", "window",
+    "with", "xmltable", "json_table",
+}
+
+
+def quote_identifier(name, force=False):
+    if name is None:
+        return ""
+    text = str(name)
+    if (force or text.lower() in RESERVED_IDENTIFIERS or
+            not re.match(r"^[a-z_][a-z0-9_]*$", text)):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
 def plan_line(node, timing=False):
     flags = node.get("Flags", 0)
     _json_name, name, _props = postgres_node_names(node)
@@ -1517,16 +1589,58 @@ def plan_line(node, timing=False):
             name += " Backward"
     if node.get("Index Name"):
         if node.get("Node Type") == "Bitmap Index Scan":
-            name += f" on {node['Index Name']}"
+            name += f" on {quote_identifier(node['Index Name'])}"
         else:
-            name += f" using {node['Index Name']}"
+            name += f" using {quote_identifier(node['Index Name'])}"
     if node.get("Relation Name"):
-        relname = node["Relation Name"]
+        relname = quote_identifier(node["Relation Name"])
         if node.get("Schema"):
-            relname = f"{node['Schema']}.{relname}"
+            relname = f"{quote_identifier(node['Schema'])}.{relname}"
         name += f" on {relname}"
         if node.get("Alias") and node["Alias"] != node["Relation Name"]:
-            name += f" {node['Alias']}"
+            name += f" {quote_identifier(node['Alias'])}"
+    elif node.get("Node Type") == "Function Scan":
+        alias = node.get("Alias")
+        objectname = node.get("Function Name")
+        if objectname:
+            target = quote_identifier(objectname)
+            if node.get("Schema"):
+                target = f"{quote_identifier(node['Schema'])}.{target}"
+            name += f" on {target}"
+            if alias and alias != objectname:
+                name += f" {quote_identifier(alias)}"
+        elif alias:
+            name += f" on {quote_identifier(alias)}"
+    elif node.get("Node Type") == "Table Function Scan":
+        alias = node.get("Alias")
+        objectname = node.get("Table Function Name")
+        if objectname:
+            name += f" on {quote_identifier(objectname, force=True)}"
+            if alias and alias != objectname:
+                name += f" {quote_identifier(alias)}"
+        elif alias:
+            name += f" on {quote_identifier(alias)}"
+    elif node.get("Node Type") in ("CTE Scan", "WorkTable Scan"):
+        alias = node.get("Alias")
+        objectname = node.get("CTE Name")
+        if objectname:
+            name += f" on {quote_identifier(objectname)}"
+            if alias and alias != objectname:
+                name += f" {quote_identifier(alias)}"
+        elif alias:
+            name += f" on {quote_identifier(alias)}"
+    elif node.get("Node Type") == "Named Tuplestore Scan":
+        alias = node.get("Alias")
+        objectname = node.get("Tuplestore Name")
+        if objectname:
+            name += f" on {quote_identifier(objectname)}"
+            if alias and alias != objectname:
+                name += f" {quote_identifier(alias)}"
+        elif alias:
+            name += f" on {quote_identifier(alias)}"
+    elif node.get("Node Type") in ("Subquery Scan", "Values Scan"):
+        if node.get("Alias"):
+            name += f" on {quote_identifier(node['Alias'])}"
     cost = (
         f"(cost={node.get('Startup Cost', 0):.2f}.."
         f"{node.get('Total Cost', 0):.2f} rows={node.get('Plan Rows', 0):.0f} "
@@ -1552,9 +1666,10 @@ def plan_line(node, timing=False):
 
 
 TEXT_DETAIL_ORDER = [
-    "Output", "Inner Unique", "Index Cond", "Recheck Cond", "TID Cond", "Order By",
-    "Hash Cond", "Merge Cond", "Join Filter", "Filter", "One-Time Filter",
-    "Run Condition", "Rows Removed by Filter",
+    "Output", "Function Call", "Table Function Call", "Window",
+    "Inner Unique", "Index Cond", "Recheck Cond", "TID Cond", "Order By",
+    "Hash Cond", "Merge Cond", "Join Filter", "Sampling Method", "Filter",
+    "One-Time Filter", "Run Condition", "Rows Removed by Filter",
     "Rows Removed by Join Filter", "Rows Removed by Index Recheck",
     "Rows Removed by Conflict Filter", "Sort Key", "Presorted Key",
     "Group Key", "Hash Key", "Heap Fetches", "Workers Planned",
@@ -1562,6 +1677,53 @@ TEXT_DETAIL_ORDER = [
     "Cache Key", "Cache Mode", "Conflict Resolution",
     "Conflict Arbiter Index", "Conflict Filter", "Merge Actions",
 ]
+
+
+def format_sampling_text(node):
+    params = node.get("Sampling Parameters", [])
+    if not isinstance(params, list):
+        params = [params]
+    rendered = f"Sampling: {node.get('Sampling Method')} ({', '.join(params)})"
+    if node.get("Repeatable Seed"):
+        rendered += f" REPEATABLE ({node['Repeatable Seed']})"
+    return rendered
+
+
+def format_incremental_sort_group_text(label, value):
+    methods = value.get("Sort Methods Used", [])
+    if not isinstance(methods, list):
+        methods = [methods]
+    method_label = "Sort Methods" if len(methods) > 1 else "Sort Method"
+    parts = [
+        f"{label}: {int(value.get('Group Count', 0))}",
+        f"{method_label}: {', '.join(methods)}",
+    ]
+    for key, space_name in (
+        ("Sort Space Memory", "Memory"),
+        ("Sort Space Disk", "Disk"),
+    ):
+        space = value.get(key)
+        if not isinstance(space, dict):
+            continue
+        parts.append(
+            f"Average {space_name}: "
+            f"{int(space.get('Average Sort Space Used', 0))}kB"
+        )
+        parts.append(
+            f"Peak {space_name}: "
+            f"{int(space.get('Peak Sort Space Used', 0))}kB"
+        )
+    return "  ".join(parts)
+
+
+def format_memoize_stats_text(value):
+    return (
+        f"Hits: {int(value.get('Cache Hits', 0))}  "
+        f"Misses: {int(value.get('Cache Misses', 0))}  "
+        f"Evictions: {int(value.get('Cache Evictions', 0))}  "
+        f"Overflows: {int(value.get('Cache Overflows', 0))}  "
+        f"Memory Usage: {int(value.get('Peak Memory Usage', 0))}kB"
+    )
 
 
 def render_value_text(label, value):
@@ -1576,7 +1738,10 @@ def render_value_text(label, value):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, dict):
         if label == "Sort Info":
-            return (f"Sort Method: {value['Sort Method']}  "
+            prefix = ""
+            if int(value.get("Worker", -1)) >= 0:
+                prefix = f"Worker {int(value['Worker'])}:  "
+            return (f"{prefix}Sort Method: {value['Sort Method']}  "
                     f"{value['Sort Space Type']}: {value['Sort Space Used']}kB")
         if label == "Hash Info":
             if (value["Hash Buckets"] != value["Original Hash Buckets"] or
@@ -1592,6 +1757,30 @@ def render_value_text(label, value):
         if label == "Storage Info":
             return (f"Storage: {value['Storage']}  "
                     f"Maximum Storage: {value['Maximum Storage']}kB")
+        if label in ("Full-sort Groups", "Pre-sorted Groups"):
+            return format_incremental_sort_group_text(label, value)
+        if label == "Incremental Sort Groups":
+            group_label = f"{value.get('Group Type', 'Sort')} Groups"
+            converted = {
+                "Group Count": int(value.get("Group Count", 0)),
+                "Sort Methods Used": value.get("Sort Methods Used", []),
+            }
+            if int(value.get("Peak Memory", 0)) > 0:
+                converted["Sort Space Memory"] = {
+                    "Average Sort Space Used": int(value.get("Average Memory", 0)),
+                    "Peak Sort Space Used": int(value.get("Peak Memory", 0)),
+                }
+            if int(value.get("Peak Disk", 0)) > 0:
+                converted["Sort Space Disk"] = {
+                    "Average Sort Space Used": int(value.get("Average Disk", 0)),
+                    "Peak Sort Space Used": int(value.get("Peak Disk", 0)),
+                }
+            rendered = format_incremental_sort_group_text(group_label, converted)
+            if int(value.get("Worker", -1)) >= 0:
+                rendered = f"Worker {int(value['Worker'])}:  {rendered}"
+            return rendered
+        if label == "Memoize Stats":
+            return format_memoize_stats_text(value)
         if label == "Heap Blocks":
             parts = []
             if value.get("Exact Heap Blocks", 0) > 0:
@@ -1708,19 +1897,25 @@ def render_plan_text(node, record_flags=0, indent=0):
                 continue
         if label == "Single Copy" and not node[label]:
             continue
+        if label == "Sampling Method":
+            lines.append(detail_prefix + format_sampling_text(node))
+            continue
         values = node[label]
         if not isinstance(values, list) or (values and isinstance(values[0], str)):
             values = [values]
         for value in values:
             if label.startswith("Rows Removed by") and float(value) <= 0:
                 continue
+            if label == "Subplans Removed" and float(value) <= 0:
+                continue
             if label in ("Sort Info", "Hash Info", "Storage Info"):
                 lines.append(detail_prefix + render_value_text(label, value))
             else:
                 lines.append(detail_prefix + f"{label}: {render_value_text(label, value)}")
     for label in ("Sort Info", "Hash Info", "Storage Info", "Heap Blocks",
-                  "Memoize Stats", "HashAgg Stats",
-                  "Incremental Sort Groups", "Conflict Tuples", "Merge Tuples"):
+                  "Memoize Stats", "HashAgg Stats", "Incremental Sort Groups",
+                  "Full-sort Groups", "Pre-sorted Groups", "Conflict Tuples",
+                  "Merge Tuples"):
         if label not in node:
             continue
         values = node[label]
@@ -1730,7 +1925,14 @@ def render_plan_text(node, record_flags=0, indent=0):
             rendered = render_value_text(label, value)
             if label == "Heap Blocks" and rendered == "":
                 continue
-            if label in ("Sort Info", "Hash Info", "Storage Info"):
+            if label == "Subplans Removed" and float(value) <= 0:
+                continue
+            if (label == "Sort Info" and isinstance(value, dict) and
+                    int(value.get("Worker", -1)) >= 0):
+                continue
+            if label in ("Sort Info", "Hash Info", "Storage Info",
+                         "Memoize Stats", "Incremental Sort Groups",
+                         "Full-sort Groups", "Pre-sorted Groups"):
                 lines.append(detail_prefix + rendered)
             else:
                 lines.append(detail_prefix + f"{label}: {rendered}")
@@ -1754,20 +1956,35 @@ def render_plan_text(node, record_flags=0, indent=0):
         walline = format_wal_text(node["WAL"])
         if walline:
             lines.append(detail_prefix + walline)
+    if "Sort Info" in node:
+        values = node["Sort Info"]
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            if (isinstance(value, dict) and
+                    int(value.get("Worker", -1)) >= 0):
+                lines.append(detail_prefix + render_value_text("Sort Info", value))
     for child in node.get("Plans", []):
-        lines.extend(render_plan_text(child, record_flags, child_indent))
+        if child.get("Subplan Name"):
+            lines.append(" " * child_indent + child["Subplan Name"])
+            lines.extend(render_plan_text(child, record_flags,
+                                          child_indent + 2))
+        else:
+            lines.extend(render_plan_text(child, record_flags, child_indent))
     return lines
 
 
 def render_planning_text(planning):
-    lines = ["Planning:"]
+    lines = []
     bufline = format_buffers_text(planning)
     if bufline:
         lines.append("  " + bufline)
     ioline = format_io_timings_text(planning)
     if ioline:
         lines.append("  " + ioline)
-    return lines
+    if not lines:
+        return []
+    return ["Planning:"] + lines
 
 
 def render_text(records):
@@ -2015,6 +2232,10 @@ def render_yaml(records):
 
 
 def xml_tag_name(key):
+    if key in ("Full-sort Groups", "Pre-sorted Groups"):
+        return "Incremental-Sort-Groups"
+    if key in ("Sort Space Memory", "Sort Space Disk"):
+        return "Sort-Space"
     return re.sub(r"[^A-Za-z0-9_.-]", "-", str(key))
 
 

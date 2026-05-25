@@ -15,6 +15,11 @@ Build and install it with PGXS:
     make PG_CONFIG=/path/to/pg_config
     make install PG_CONFIG=/path/to/pg_config
 
+The PGXS install includes extension metadata, so CREATE EXTENSION
+auto_explain_z can load the module in the current session. For automatic plan
+logging in new sessions, continue to use session_preload_libraries or
+shared_preload_libraries.
+
 Run TAP tests with PostgreSQL's installed PGXS harness when the target
 PostgreSQL build has TAP support enabled:
 
@@ -29,6 +34,8 @@ matches the target server:
 
 tapcheck automatically includes Perl modules installed below ~/perl5. If
 dependencies such as IPC::Run are installed elsewhere, pass PERL5LIB as usual.
+Use make fulltapcheck with the same variables to run every decoder node case
+through every supported format and EXPLAIN mode.
 
 Binary files are written per backend to auto_explain_z.directory, which
 defaults to auto_explain_z below the data directory. The "simple" profile is a
@@ -71,23 +78,31 @@ can be grouped by plan without first resolving template references.
 
 Template compression is controlled by:
 
-* auto_explain_z.template_cache: enable the per-backend template dictionary
+* auto_explain_z.template_cache: enable template definitions and references
 * auto_explain_z.template_fast_path: after a query id has a template, allow
   simple metric-free references without hashing the whole plan every time; the
   cached plan pointer is part of the fast-path key
 * auto_explain_z.template_fast_path_recheck: executions between safety rechecks
   of the query-id fast path; default 0 disables periodic rechecks
-* auto_explain_z.max_templates: cap unique templates per backend per file
+* auto_explain_z.max_templates: cap unique templates admitted to the cache
 * auto_explain_z.template_min_plan_bytes: only template plans above this size
   (default 0, so repeated small plan shapes can be templated)
 * auto_explain_z.template_omit_query_text: store query text on template
   definition records, but omit it from later template-reference records
 
+When auto_explain_z is loaded through shared_preload_libraries, template
+admission is shared across backends under auto_explain_z.max_templates. Each
+binary file still writes its own template definition before writing references,
+so decoding never depends on templates stored in another backend's file. If the
+module is loaded later with LOAD or session_preload_libraries, it falls back to
+the same per-file behavior with a backend-local admission cache.
+
 Templates are keyed by query id plus a structural plan-shape hash. The hash
 includes relation/index identity, node type hierarchy, relevant plan options,
 and full-profile expression trees where those would affect reconstructed
-EXPLAIN output. The dictionary resets when a backend rotates to a new binary
-file, so every template reference is resolvable from records in the same file.
+EXPLAIN output. The per-file definition dictionary resets when a backend
+rotates to a new binary file, so every template reference is resolvable from
+records in the same file.
 Template definition records store template_id, plan identifier, optional query
 text, query id, and the full static plan tree. Template-reference records store
 template_id, plan identifier, and optional per-execution sections; only query id
@@ -141,6 +156,11 @@ Benchmark auto_explain_z against contrib/auto_explain with pgbench:
         --aez-profiles simple,full --compressions none,lz4,zstd \
         --template-modes on,off
 
+The standard comparison matrix is available as a shortcut:
+
+    auto_explain_z_bench --standard-matrix --scale 10 --clients 8 \
+        --duration 30 --iterations 3
+
 The benchmark creates a temporary cluster, initializes pgbench, restarts the
 server for baseline, auto_explain, and auto_explain_z scenarios, and reports
 mean pgbench throughput/latency, throughput standard deviation, sampled server
@@ -152,7 +172,8 @@ and build/load contrib/auto_explain from that tree while loading auto_explain_z
 from this standalone checkout.
 Built-in pgbench workloads are select-only, simple-update, and tpcb-like. The
 shape-* workloads create additional indexed lookup, range aggregate, join,
-complex CTE/aggregate, and very complex CTE/window/join plans.
+complex CTE/aggregate, very complex CTE/window/join plans, and a broad
+shape-node-suite workload.
 Use --aez-profiles, --workloads, --iterations, --analyze, --buffers,
 --compression, --compressions, --template-cache, --template-modes,
 --auto-explain-format, and --auto-explain-formats to compare other logging
