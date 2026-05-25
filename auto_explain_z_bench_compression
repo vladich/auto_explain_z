@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+exec "$script_dir/auto_explain_z_bench" \
+	--workloads shape-simple-point,shape-complex,shape-very-complex,shape-node-suite \
+	--auto-explain-formats text,json \
+	--aez-profiles simple,full \
+	--compressions none,lz4,zstd \
+	--template-modes off \
+	"$@"

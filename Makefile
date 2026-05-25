@@ -8,7 +8,15 @@ MODULES = auto_explain_z_testscan
 
 PGFILEDESC = "auto_explain_z - binary compressed execution plan logger"
 
-SCRIPTS = auto_explain_z_bench auto_explain_z_dump
+SCRIPTS = \
+	auto_explain_z_bench \
+	auto_explain_z_bench_all_modes \
+	auto_explain_z_bench_compression \
+	auto_explain_z_bench_formats \
+	auto_explain_z_bench_profiles \
+	auto_explain_z_bench_shapes \
+	auto_explain_z_bench_templates \
+	auto_explain_z_dump
 
 EXTENSION = auto_explain_z
 DATA = auto_explain_z--1.0.sql

@@ -161,6 +161,27 @@ The standard comparison matrix is available as a shortcut:
     auto_explain_z_bench --standard-matrix --scale 10 --clients 8 \
         --duration 30 --iterations 3
 
+Separate benchmark entry points are also installed for the common comparison
+axes. All of them accept the normal auto_explain_z_bench options for scale,
+clients, duration, iterations, pg_config, JSON output, and server paths:
+
+    auto_explain_z_bench_all_modes
+    auto_explain_z_bench_templates
+    auto_explain_z_bench_profiles
+    auto_explain_z_bench_compression
+    auto_explain_z_bench_shapes
+    auto_explain_z_bench_formats
+
+auto_explain_z_bench_all_modes runs the broad matrix: simple/complex/very
+complex/node-suite workloads, auto_explain text/json, auto_explain_z
+simple/full, compression none/lz4/zstd, and template cache on/off.
+auto_explain_z_bench_templates isolates template cache on/off.
+auto_explain_z_bench_profiles isolates simple versus full auto_explain_z
+profiles. auto_explain_z_bench_compression isolates none/lz4/zstd.
+auto_explain_z_bench_shapes isolates plan complexity across the built-in
+shape workloads. auto_explain_z_bench_formats compares regular auto_explain
+text/json/yaml/xml against auto_explain_z simple/full.
+
 The benchmark creates a temporary cluster, initializes pgbench, restarts the
 server for baseline, auto_explain, and auto_explain_z scenarios, and reports
 mean pgbench throughput/latency, throughput standard deviation, sampled server
