@@ -113,6 +113,33 @@ profile records without ANALYZE omit that metrics tree entirely, so repeated
 executions do not repeat relation names, index names, quals, sort/group/hash
 keys, estimates, or other static EXPLAIN details.
 
+Binary log rotation is configured with settings modelled after PostgreSQL's
+regular log collector:
+
+* auto_explain_z.log_rotation_age: rotate a backend's current binary log after
+  this many minutes; default 24 hours, 0 disables time-based rotation
+* auto_explain_z.log_rotation_size: rotate after this many KiB of uncompressed
+  serialized records; default 1 GiB, 0 disables size-based rotation
+* auto_explain_z.max_file_size: deprecated alias for log_rotation_size
+* auto_explain_z.log_truncate_on_rotation: truncate if a time-based rotation
+  opens an already-existing generated file name
+* auto_explain_z.log_filename: optional strftime pattern included in generated
+  file names; an empty value keeps the legacy backend-start-time name
+
+auto_explain_z always keeps per-backend files isolated, so generated names also
+include auto_explain_z.file_prefix, backend pid, rotation index, and the .aez
+suffix. If log_filename is set to a pattern such as aez-%Y%m%d%H%M%S, a file
+name looks like auto_explain_z-aez-20260525123000-12345-0.aez.
+
+CREATE EXTENSION auto_explain_z installs auto_explain_z_rotate_logfile(), which
+is analogous to pg_rotate_logfile(). When the module is loaded through
+shared_preload_libraries, the function records a shared rotation request and
+each backend rotates its current binary file before writing its next record.
+When loaded later with LOAD or session_preload_libraries, it can only request
+rotation for the current backend. EXECUTE is revoked from public by default, so
+grant it explicitly to operational roles that should be allowed to rotate AEZ
+logs.
+
 Retention cleanup is opportunistic and runs when a backend opens or rotates a
 binary log file:
 

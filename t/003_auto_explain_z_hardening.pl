@@ -115,6 +115,9 @@ my $data_dir = abs_path($node->data_dir);
 my $module_dir = "$FindBin::Bin/..";
 my $extshare = "$data_dir/extshare";
 my $good_dir = "$data_dir/aez_good";
+my $manual_rotation_dir = "$data_dir/aez_manual_rotation";
+my $size_rotation_dir = "$data_dir/aez_size_rotation";
+my $filename_rotation_dir = "$data_dir/aez_filename_rotation";
 my $template_dir = "$data_dir/aez_templates";
 my $multi_dir = "$data_dir/aez_multi";
 my $retention_dir = "$data_dir/aez_retention";
@@ -148,6 +151,14 @@ CREATE EXTENSION auto_explain_z;
 SELECT extversion FROM pg_extension WHERE extname = 'auto_explain_z';
 });
 is($extversion, '1.0', 'CREATE EXTENSION auto_explain_z registers metadata');
+my $rotate_acl = $node->safe_psql(
+	'postgres',
+	q{
+SELECT has_function_privilege('public',
+	'auto_explain_z_rotate_logfile()', 'EXECUTE');
+});
+is($rotate_acl, 'f',
+	'auto_explain_z_rotate_logfile execute is revoked from public');
 
 $node->safe_psql(
 	'postgres', q{
@@ -180,6 +191,70 @@ for my $record (@$good_raw)
 	is($record->{Template}->{Mode}, 'none',
 		'template_cache=off emits standalone records only');
 }
+
+my $rotate_result = $node->safe_psql(
+	'postgres',
+	"SET auto_explain_z.directory = " . sql_string($manual_rotation_dir) . q{;
+SET auto_explain_z.file_prefix = 'manual';
+SET auto_explain_z.log_min_duration = 0;
+SET auto_explain_z.profile = simple;
+SET auto_explain_z.compression = none;
+SET auto_explain_z.pending_buffer_size = 0;
+SET auto_explain_z.template_cache = off;
+SELECT count(*) FROM aez_harden WHERE id BETWEEN 31 AND 40;
+SELECT auto_explain_z_rotate_logfile();
+SELECT count(*) FROM aez_harden WHERE id BETWEEN 41 AND 50;
+});
+like($rotate_result, qr/^t$/m,
+	'auto_explain_z_rotate_logfile reports a successful rotation request');
+my @manual_rotation_files = aez_files($manual_rotation_dir, 'manual');
+ok(scalar(@manual_rotation_files) >= 2,
+	'manual rotation creates a new binary log file in the current backend');
+my $manual_rotation_json = decode_pg_json_files(@manual_rotation_files);
+like($manual_rotation_json, qr/"Node Type": "Aggregate"/,
+	'decoder reads manually rotated files');
+
+my $large_query_text = 'x' x 4096;
+$node->safe_psql(
+	'postgres',
+	"SET auto_explain_z.directory = " . sql_string($size_rotation_dir) . q{;
+SET auto_explain_z.file_prefix = 'size';
+SET auto_explain_z.log_filename = '';
+SET auto_explain_z.log_min_duration = 0;
+SET auto_explain_z.profile = simple;
+SET auto_explain_z.compression = none;
+SET auto_explain_z.pending_buffer_size = 0;
+SET auto_explain_z.template_cache = off;
+SET auto_explain_z.log_rotation_size = 1;
+SELECT length(} . sql_string($large_query_text) . q{);
+SELECT length(} . sql_string($large_query_text) . q{);
+SELECT length(} . sql_string($large_query_text) . q{);
+});
+my @size_rotation_files = aez_files($size_rotation_dir, 'size');
+ok(scalar(@size_rotation_files) >= 2,
+	'log_rotation_size rotates binary log files');
+my $size_rotation_json = decode_pg_json_files(@size_rotation_files);
+like($size_rotation_json, qr/"Node Type": "Result"/,
+	'decoder reads size-rotated files');
+
+$node->safe_psql(
+	'postgres',
+	"SET auto_explain_z.directory = " . sql_string($filename_rotation_dir) . q{;
+SET auto_explain_z.file_prefix = 'named';
+SET auto_explain_z.log_filename = 'aez-%Y%m%d%H%M%S';
+SET auto_explain_z.log_min_duration = 0;
+SET auto_explain_z.profile = simple;
+SET auto_explain_z.compression = none;
+SET auto_explain_z.pending_buffer_size = 0;
+SET auto_explain_z.template_cache = off;
+SELECT count(*) FROM aez_harden WHERE id BETWEEN 51 AND 60;
+});
+my @filename_rotation_files = aez_files($filename_rotation_dir, 'named');
+ok(scalar(@filename_rotation_files) == 1,
+	'log_filename pattern creates a matching binary log file');
+like(basename($filename_rotation_files[0]),
+	qr/^named-aez-\d{14}-\d+-0\.aez$/,
+	'log_filename strftime pattern is included in the generated file name');
 
 my $bad_magic = "$data_dir/aez_bad_magic.aez";
 copy($good_files[0], $bad_magic) or die "could not copy $good_files[0]: $!";
