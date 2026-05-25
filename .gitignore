@@ -1,0 +1,13 @@
+# Generated subdirectories
+/log/
+/results/
+/tmp_check/
+
+# Build outputs
+__pycache__/
+*.a
+*.bc
+*.dylib
+*.o
+*.pyc
+*.so

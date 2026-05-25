@@ -1,0 +1,2119 @@
+#!/usr/bin/env python3
+#
+# Decode auto_explain_z binary logs.
+#
+
+import argparse
+import copy
+import datetime as _dt
+import html
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+
+
+FILE_MAGIC = 0x315A4541
+RECORD_MAGIC = 0x325A4541
+PAYLOAD_MAGIC = 0x335A4541
+STRING_NULL = 0xFFFFFFFF
+STRING_NULL_CTRL = 0x80
+CONTEXT_REF = 0x80
+
+COMPRESSION_NONE = 0
+COMPRESSION_LZ4 = 1
+COMPRESSION_ZSTD = 2
+
+PROFILE_SIMPLE = 0
+PROFILE_FULL = 1
+
+TEMPLATE_NONE = 0
+TEMPLATE_DEFINE = 1
+TEMPLATE_REF = 2
+TEMPLATE_HAS_METRICS = 0x40
+TEMPLATE_HAS_DETAILS = 0x80
+
+FLAG_ANALYZE = 0x00000001
+FLAG_VERBOSE = 0x00000002
+FLAG_COSTS = 0x00000004
+FLAG_TIMING = 0x00000008
+FLAG_BUFFERS = 0x00000010
+FLAG_WAL = 0x00000020
+FLAG_QUERY_TEXT = 0x00000040
+FLAG_PARAMS = 0x00000080
+
+NODE_HAS_ACTUAL = 0x0004
+NODE_NEVER_EXECUTED = 0x0008
+NODE_HAS_BUFFERS = 0x0010
+NODE_HAS_WAL = 0x0020
+NODE_PARALLEL_AWARE = 0x0001
+NODE_ASYNC_CAPABLE = 0x0002
+NODE_DISABLED = 0x0040
+
+EXTRA_MODIFY_OPERATION = 1
+EXTRA_FOREIGN_OPERATION = 2
+EXTRA_JOIN_TYPE = 3
+EXTRA_AGG = 4
+EXTRA_SETOP = 5
+EXTRA_INDEX_SCAN_DIRECTION = 6
+
+OBJ_RELATION = 0x01
+OBJ_INDEX = 0x02
+
+DETAIL_STRING = 1
+DETAIL_STRING_LIST = 2
+DETAIL_DOUBLE = 3
+DETAIL_INT64 = 4
+DETAIL_UINT64 = 5
+DETAIL_BOOL = 6
+
+DYNAMIC_DETAIL_CODES = {
+    18,  # heap fetches
+    20,  # workers launched
+    21,  # rows removed by filter
+    22,  # rows removed by join filter
+    23,  # rows removed by index recheck
+    25,  # sort info
+    26,  # incremental sort group
+    27,  # hash info
+    28,  # storage info
+    31,  # memoize stats
+    33,  # hashagg stats
+    34,  # index searches
+    35,  # bitmap heap blocks
+    40,  # rows removed by conflict filter
+    41,  # conflict tuples
+    42,  # merge tuples
+    45,  # extension explain text
+}
+
+DETAIL_LABELS = {
+    1: "Output",
+    2: "Filter",
+    3: "Index Cond",
+    4: "Order By",
+    5: "Recheck Cond",
+    6: "TID Cond",
+    7: "Join Filter",
+    8: "Hash Cond",
+    9: "Merge Cond",
+    10: "Sort Key",
+    11: "Presorted Key",
+    12: "Group Key",
+    13: "Hash Key",
+    14: "Function Call",
+    15: "Table Function Call",
+    16: "One-Time Filter",
+    17: "Run Condition",
+    18: "Heap Fetches",
+    19: "Workers Planned",
+    20: "Workers Launched",
+    21: "Rows Removed by Filter",
+    22: "Rows Removed by Join Filter",
+    23: "Rows Removed by Index Recheck",
+    24: "Inner Unique",
+    25: "Sort Info",
+    26: "Incremental Sort Groups",
+    27: "Hash Info",
+    28: "Storage Info",
+    29: "Cache Key",
+    30: "Cache Mode",
+    31: "Memoize Stats",
+    32: "Planned Partitions",
+    33: "HashAgg Stats",
+    34: "Index Searches",
+    35: "Heap Blocks",
+    36: "Subplans Removed",
+    37: "Conflict Resolution",
+    38: "Conflict Arbiter Index",
+    39: "Conflict Filter",
+    40: "Rows Removed by Conflict Filter",
+    41: "Conflict Tuples",
+    42: "Merge Tuples",
+    43: "Trigger",
+    44: "JIT",
+    45: "Extension Explain",
+    46: "Merge Actions",
+    47: "Planning",
+    48: "Custom Plan Provider",
+    49: "Single Copy",
+}
+
+RELATIONSHIP_NAMES = {
+    0: None,
+    1: "Outer",
+    2: "Inner",
+    3: "Member",
+    4: "Subquery",
+    5: "InitPlan",
+    6: "SubPlan",
+    7: "Custom",
+}
+
+NODE_NAMES = {
+    331: "Result",
+    332: "ProjectSet",
+    333: "ModifyTable",
+    334: "Append",
+    335: "Merge Append",
+    336: "Recursive Union",
+    337: "BitmapAnd",
+    338: "BitmapOr",
+    339: "Seq Scan",
+    340: "Sample Scan",
+    341: "Index Scan",
+    342: "Index Only Scan",
+    343: "Bitmap Index Scan",
+    344: "Bitmap Heap Scan",
+    345: "Tid Scan",
+    346: "Tid Range Scan",
+    347: "Subquery Scan",
+    348: "Function Scan",
+    349: "Values Scan",
+    350: "Table Function Scan",
+    351: "CTE Scan",
+    352: "Named Tuplestore Scan",
+    353: "WorkTable Scan",
+    354: "Foreign Scan",
+    355: "Custom Scan",
+    356: "Nested Loop",
+    358: "Merge Join",
+    359: "Hash Join",
+    360: "Materialize",
+    361: "Memoize",
+    362: "Sort",
+    363: "Incremental Sort",
+    364: "Group",
+    365: "Aggregate",
+    366: "WindowAgg",
+    367: "Unique",
+    368: "Gather",
+    369: "Gather Merge",
+    370: "Hash",
+    371: "SetOp",
+    372: "LockRows",
+    373: "Limit",
+}
+
+
+def load_nodetags(script_path):
+    """Prefer the source-tree nodetags when the tool is run in-tree."""
+    candidates = [
+        os.path.abspath(
+            os.path.join(os.path.dirname(script_path), "..", "..", "src",
+                         "include", "nodes", "nodetags.h")),
+        os.path.abspath(os.path.join(os.getcwd(), "src", "include", "nodes",
+                                     "nodetags.h")),
+    ]
+    tags = dict(NODE_NAMES)
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"\s*T_(\w+)\s*=\s*(\d+),", line)
+                if m and int(m.group(2)) not in tags:
+                    tags[int(m.group(2))] = m.group(1)
+        break
+    return tags
+
+
+NODE_NAMES = load_nodetags(sys.argv[0])
+
+
+class DecodeError(Exception):
+    pass
+
+
+class PGNumeric:
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+    def __float__(self):
+        return float(self.text)
+
+
+def pg_numeric(value, ndigits):
+    return PGNumeric(f"{value:.{ndigits}f}")
+
+
+def pg_int64(value):
+    value = int(value)
+    if value >= (1 << 63):
+        value -= (1 << 64)
+    return value
+
+
+class Reader:
+    def __init__(self, data, offset=0, version=3):
+        self.data = data
+        self.pos = offset
+        self.version = version
+
+    def remaining(self):
+        return len(self.data) - self.pos
+
+    def take(self, n):
+        if self.pos + n > len(self.data):
+            raise DecodeError("unexpected end of data")
+        out = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return out
+
+    def u8(self):
+        return self.take(1)[0]
+
+    def u16(self):
+        return struct.unpack_from("<H", self.take(2))[0]
+
+    def u32(self):
+        return struct.unpack_from("<I", self.take(4))[0]
+
+    def i32(self):
+        return struct.unpack_from("<i", self.take(4))[0]
+
+    def u64(self):
+        return struct.unpack_from("<Q", self.take(8))[0]
+
+    def i64(self):
+        return struct.unpack_from("<q", self.take(8))[0]
+
+    def double(self):
+        return struct.unpack_from("<d", self.take(8))[0]
+
+    def uint_sized(self, code):
+        if code == 0:
+            return self.u8()
+        if code == 1:
+            return self.u16()
+        if code == 2:
+            return self.u32()
+        if code == 3:
+            return self.u64()
+        raise DecodeError(f"bad integer size code {code}")
+
+    def int_sized(self, code):
+        n = self.uint_sized(code)
+        bits = (1, 2, 4, 8)[code] * 8
+        sign = 1 << (bits - 1)
+        if n & sign:
+            n -= 1 << bits
+        return n
+
+    def string_v3(self):
+        n = self.u32()
+        if n == STRING_NULL:
+            return None
+        return self.take(n).decode("utf-8", "replace")
+
+    def string_v4(self):
+        ctrl = self.u8()
+        if ctrl == STRING_NULL_CTRL:
+            return None
+        n = self.uint_sized(ctrl & 0x03)
+        return self.take(n).decode("utf-8", "replace")
+
+    def string(self):
+        if self.version >= 4:
+            return self.string_v4()
+        return self.string_v3()
+
+
+def pg_timestamp_to_iso(ts):
+    if ts is None:
+        return None
+    epoch = _dt.datetime(2000, 1, 1, tzinfo=_dt.timezone.utc)
+    return (epoch + _dt.timedelta(microseconds=ts)).isoformat()
+
+
+def decompress_payload(method, data, expected_len):
+    if method == COMPRESSION_NONE:
+        return data
+    if method == COMPRESSION_LZ4:
+        try:
+            import lz4.block
+            return lz4.block.decompress(data, uncompressed_size=expected_len)
+        except Exception:
+            pass
+        try:
+            import ctypes
+            for name in ("liblz4.dylib", "liblz4.so.1", "liblz4.so"):
+                try:
+                    lib = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    lib = None
+            if lib is not None:
+                out = ctypes.create_string_buffer(expected_len)
+                rc = lib.LZ4_decompress_safe(data, out, len(data), expected_len)
+                if rc < 0:
+                    raise DecodeError("lz4 decompression failed")
+                return out.raw[:rc]
+        except Exception:
+            pass
+        raise DecodeError("lz4 compressed record requires python-lz4 or liblz4")
+    if method == COMPRESSION_ZSTD:
+        try:
+            import zstandard
+            return zstandard.ZstdDecompressor().decompress(data,
+                                                           max_output_size=expected_len)
+        except Exception:
+            pass
+        try:
+            proc = subprocess.run(["zstd", "-dc"], input=data,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  check=True)
+            return proc.stdout
+        except Exception:
+            pass
+        raise DecodeError("zstd compressed record requires zstandard or zstd")
+    raise DecodeError(f"unknown compression method {method}")
+
+
+def decompress_file_body(method, data):
+    if method == COMPRESSION_NONE:
+        return data
+    if method == COMPRESSION_LZ4:
+        try:
+            import lz4.frame
+            return lz4.frame.decompress(data)
+        except Exception:
+            pass
+        try:
+            proc = subprocess.run(["lz4", "-dc"], input=data,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  check=True)
+            return proc.stdout
+        except Exception:
+            pass
+        raise DecodeError("lz4 file stream requires python-lz4 or lz4")
+    if method == COMPRESSION_ZSTD:
+        try:
+            import zstandard
+            dctx = zstandard.ZstdDecompressor()
+            with dctx.stream_reader(data) as reader:
+                return reader.read()
+        except Exception:
+            pass
+        try:
+            proc = subprocess.run(["zstd", "-dc"], input=data,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  check=True)
+            return proc.stdout
+        except Exception:
+            pass
+        raise DecodeError("zstd file stream requires zstandard or zstd")
+    raise DecodeError(f"unknown compression method {method}")
+
+
+def parse_details(r):
+    details = []
+    count = r.u16()
+    for _ in range(count):
+        code = r.u16()
+        typ = r.u8()
+        if typ == DETAIL_STRING:
+            value = r.string()
+        elif typ == DETAIL_STRING_LIST:
+            value = [r.string() for _ in range(r.u32())]
+        elif typ == DETAIL_DOUBLE:
+            value = r.double()
+        elif typ == DETAIL_INT64:
+            value = r.i64()
+        elif typ == DETAIL_UINT64:
+            value = r.u64()
+        elif typ == DETAIL_BOOL:
+            value = bool(r.u8())
+        else:
+            raise DecodeError(f"unknown detail type {typ}")
+        details.append({
+            "code": code,
+            "label": DETAIL_LABELS.get(code, f"Detail {code}"),
+            "value": value,
+        })
+    return details
+
+
+def parse_actual(r, flags):
+    if r.version >= 4 and not (flags & NODE_HAS_ACTUAL):
+        return None
+    actual = {
+        "Startup Time": r.i64() / 1000.0,
+        "Total Time": r.i64() / 1000.0,
+        "Actual Rows": r.double(),
+        "Actual Loops": r.double(),
+    }
+    if not (flags & NODE_HAS_ACTUAL):
+        return None
+    return actual
+
+
+def parse_buffers(r):
+    names = [
+        "Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+        "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks",
+        "Local Dirtied Blocks", "Local Written Blocks", "Temp Read Blocks",
+        "Temp Written Blocks", "Shared Read Time", "Shared Write Time",
+        "Local Read Time", "Local Write Time", "Temp Read Time",
+        "Temp Write Time",
+    ]
+    values = {}
+    for name in names[:10]:
+        values[name] = r.i64()
+    for name in names[10:]:
+        values[name] = r.i64() / 1000.0
+    return values
+
+
+def parse_wal(r):
+    return {
+        "WAL Records": r.i64(),
+        "WAL FPI": r.i64(),
+        "WAL Bytes": r.u64(),
+        "WAL Buffers Full": r.i64(),
+    }
+
+
+def parse_identity(r):
+    ctrl = r.u8()
+    flags = ctrl & 0x03 if r.version >= 4 else ctrl
+    ident = {}
+    if flags & OBJ_RELATION:
+        if r.version >= 4:
+            ident["Relation OID"] = r.uint_sized((ctrl >> 2) & 0x03)
+        else:
+            ident["Relation OID"] = r.u32()
+        ident["Relation Name"] = r.string()
+        ident["Alias"] = r.string()
+        if r.version >= 9:
+            schema = r.string()
+            if schema is not None:
+                ident["Schema"] = schema
+    if flags & OBJ_INDEX:
+        if r.version >= 4:
+            ident["Index OID"] = r.uint_sized((ctrl >> 4) & 0x03)
+        else:
+            ident["Index OID"] = r.u32()
+        ident["Index Name"] = r.string()
+    return ident
+
+
+def parse_full_plan_node(r):
+    relationship = r.u8()
+    node_tag = r.u16()
+    flags = r.u16()
+    extra_kind = r.u8()
+    if r.version >= 4:
+        size_flags = r.u8()
+        extra1 = r.uint_sized(size_flags & 0x03)
+        extra2 = r.uint_sized((size_flags >> 2) & 0x03)
+        width_code = (size_flags >> 4) & 0x03
+        child_count_code = (size_flags >> 6) & 0x03
+    else:
+        size_flags = None
+        extra1 = r.u32()
+        extra2 = r.u32()
+        width_code = None
+        child_count_code = None
+    node = {
+        "Relationship": RELATIONSHIP_NAMES.get(relationship),
+        "Node Tag": node_tag,
+        "Node Type": NODE_NAMES.get(node_tag, f"T_{node_tag}"),
+        "Flags": flags,
+        "Startup Cost": r.double(),
+        "Total Cost": r.double(),
+        "Plan Rows": r.double(),
+        "Plan Width": r.int_sized(width_code) if r.version >= 4 else r.i32(),
+        "Plans": [],
+    }
+    if extra_kind:
+        node["Extra Kind"] = extra_kind
+        node["Extra1"] = extra1
+        node["Extra2"] = extra2
+    actual = parse_actual(r, flags)
+    if actual:
+        node.update(actual)
+    if flags & NODE_NEVER_EXECUTED:
+        node["Never Executed"] = True
+    if flags & NODE_HAS_BUFFERS:
+        node["Buffers"] = parse_buffers(r)
+    if flags & NODE_HAS_WAL:
+        node["WAL"] = parse_wal(r)
+    node.update(parse_identity(r))
+    node["Details"] = parse_details(r)
+    child_count = (r.uint_sized(child_count_code)
+                   if r.version >= 4 else r.u32())
+    node["Plans"] = [parse_full_plan_node(r) for _ in range(child_count)]
+    return node
+
+
+def parse_metric_node(r):
+    node_tag = r.u16()
+    flags = r.u16()
+    if r.version >= 4:
+        size_flags = r.u8()
+        width_code = size_flags & 0x03
+        child_count_code = (size_flags >> 2) & 0x03
+    else:
+        width_code = None
+        child_count_code = None
+    node = {
+        "Node Tag": node_tag,
+        "Node Type": NODE_NAMES.get(node_tag, f"T_{node_tag}"),
+        "Flags": flags,
+        "Startup Cost": r.double(),
+        "Total Cost": r.double(),
+        "Plan Rows": r.double(),
+        "Plan Width": r.int_sized(width_code) if r.version >= 4 else r.i32(),
+        "Plans": [],
+    }
+    actual = parse_actual(r, flags)
+    if actual:
+        node.update(actual)
+    if flags & NODE_NEVER_EXECUTED:
+        node["Never Executed"] = True
+    if flags & NODE_HAS_BUFFERS:
+        node["Buffers"] = parse_buffers(r)
+    if flags & NODE_HAS_WAL:
+        node["WAL"] = parse_wal(r)
+    node["Details"] = parse_details(r)
+    child_count = (r.uint_sized(child_count_code)
+                   if r.version >= 4 else r.u32())
+    node["Plans"] = [parse_metric_node(r) for _ in range(child_count)]
+    return node
+
+
+def strip_dynamic_details(node):
+    node = copy.deepcopy(node)
+    for key in (
+        "Startup Time", "Total Time", "Actual Rows", "Actual Loops",
+        "Never Executed", "Buffers", "WAL",
+    ):
+        node.pop(key, None)
+    node["Details"] = [
+        d for d in node.get("Details", [])
+        if d.get("code") not in DYNAMIC_DETAIL_CODES
+    ]
+    node["Plans"] = [strip_dynamic_details(c) for c in node.get("Plans", [])]
+    return node
+
+
+def merge_template_metrics(template, metrics):
+    merged = copy.deepcopy(template)
+    for key in (
+        "Flags", "Startup Cost", "Total Cost", "Plan Rows", "Plan Width",
+        "Startup Time", "Total Time", "Actual Rows", "Actual Loops",
+        "Never Executed", "Buffers", "WAL",
+    ):
+        if key in metrics:
+            merged[key] = metrics[key]
+        elif key in merged and key in ("Startup Time", "Total Time",
+                                       "Actual Rows", "Actual Loops",
+                                       "Never Executed", "Buffers", "WAL"):
+            merged.pop(key, None)
+    static_details = [
+        d for d in merged.get("Details", [])
+        if d.get("code") not in DYNAMIC_DETAIL_CODES
+    ]
+    merged["Details"] = static_details + metrics.get("Details", [])
+    merged_children = merged.get("Plans", [])
+    metric_children = metrics.get("Plans", [])
+    merged["Plans"] = [
+        merge_template_metrics(t, m)
+        for t, m in zip(merged_children, metric_children)
+    ]
+    return merged
+
+
+def detail_to_property(detail):
+    code = detail["code"]
+    value = detail["value"]
+    if code == 25 and isinstance(value, list) and len(value) == 4:
+        return {
+            "Worker": int(value[0]),
+            "Sort Method": value[1],
+            "Sort Space Type": value[2],
+            "Sort Space Used": int(value[3]),
+        }
+    if code == 26 and isinstance(value, list) and len(value) == 9:
+        return {
+            "Worker": int(value[0]),
+            "Group Type": value[1],
+            "Group Count": int(value[2]),
+            "Sort Methods Used": [v for v in value[3].split(",") if v],
+            "Memory Space Type": value[4],
+            "Average Memory": int(value[5]),
+            "Peak Memory": int(value[6]),
+            "Average Disk": int(value[7]),
+            "Peak Disk": int(value[8]),
+        }
+    if code == 27 and isinstance(value, list) and len(value) == 5:
+        return {
+            "Hash Buckets": int(value[0]),
+            "Original Hash Buckets": int(value[1]),
+            "Hash Batches": int(value[2]),
+            "Original Hash Batches": int(value[3]),
+            "Peak Memory Usage": int(value[4]),
+        }
+    if code == 28 and isinstance(value, list) and len(value) == 2:
+        return {"Storage": value[0], "Maximum Storage": int(value[1])}
+    if code == 31 and isinstance(value, list) and len(value) == 6:
+        return {
+            "Worker": int(value[0]),
+            "Cache Hits": int(value[1]),
+            "Cache Misses": int(value[2]),
+            "Cache Evictions": int(value[3]),
+            "Cache Overflows": int(value[4]),
+            "Peak Memory Usage": int(value[5]),
+        }
+    if code == 33 and isinstance(value, list) and len(value) == 4:
+        return {
+            "Worker": int(value[0]),
+            "HashAgg Batches": int(value[1]),
+            "Peak Memory Usage": int(value[2]),
+            "Disk Usage": int(value[3]),
+        }
+    if code == 35 and isinstance(value, list) and len(value) == 3:
+        return {
+            "Worker": int(value[0]),
+            "Exact Heap Blocks": int(value[1]),
+            "Lossy Heap Blocks": int(value[2]),
+        }
+    if code == 41 and isinstance(value, list) and len(value) == 2:
+        return {"Tuples Inserted": float(value[0]),
+                "Conflicting Tuples": float(value[1])}
+    if code == 42 and isinstance(value, list) and len(value) == 4:
+        return {"Tuples Inserted": float(value[0]),
+                "Tuples Updated": float(value[1]),
+                "Tuples Deleted": float(value[2]),
+                "Tuples Skipped": float(value[3])}
+    if code == 43 and isinstance(value, list) and len(value) == 5:
+        return {"Trigger Name": value[0],
+                "Constraint Name": value[1],
+                "Relation": value[2],
+                "Time": int(value[3]) / 1000.0,
+                "Calls": float(value[4])}
+    if code == 44 and isinstance(value, list) and len(value) == 13:
+        return {
+            "Functions": int(value[0]),
+            "Flags": int(value[1]),
+            "Options": {
+                "Inlining": value[2] == "true",
+                "Optimization": value[3] == "true",
+                "Expressions": value[4] == "true",
+                "Deforming": value[5] == "true",
+            },
+            "Timing": {
+                "Available": value[6] == "true",
+                "Generation": int(value[7]) / 1000.0,
+                "Deform": int(value[8]) / 1000.0,
+                "Inlining": int(value[9]) / 1000.0,
+                "Optimization": int(value[10]) / 1000.0,
+                "Emission": int(value[11]) / 1000.0,
+                "Total": int(value[12]) / 1000.0,
+            },
+        }
+    if code == 47 and isinstance(value, list) and len(value) == 16:
+        names = [
+            "Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+            "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks",
+            "Local Dirtied Blocks", "Local Written Blocks", "Temp Read Blocks",
+            "Temp Written Blocks", "Shared Read Time", "Shared Write Time",
+            "Local Read Time", "Local Write Time", "Temp Read Time",
+            "Temp Write Time",
+        ]
+        out = {}
+        for idx, name in enumerate(names[:10]):
+            out[name] = int(value[idx])
+        for idx, name in enumerate(names[10:], 10):
+            out[name] = int(value[idx]) / 1000.0
+        return out
+    return value
+
+
+def apply_details(node):
+    props = {}
+    raw = node.pop("Details", [])
+    for detail in raw:
+        label = detail["label"]
+        value = detail_to_property(detail)
+        if label in props:
+            if not isinstance(props[label], list):
+                props[label] = [props[label]]
+            props[label].append(value)
+        else:
+            props[label] = value
+    node.update(props)
+    for child in node.get("Plans", []):
+        apply_details(child)
+    return node
+
+
+def parse_payload(payload, record_header, templates):
+    version = record_header.get("Format Version", 3)
+    r = Reader(payload, version=version)
+    flags = record_header["Flags"]
+    duration_us = int(record_header["Duration"] * 1000.0)
+    query_id = record_header.get("Query Identifier", 0)
+
+    if version >= 4:
+        context_ctrl = r.u8()
+        if version >= 6 and context_ctrl & CONTEXT_REF:
+            if "__context" not in templates:
+                raise DecodeError("context referenced before definition")
+            context = copy.deepcopy(templates["__context"])
+            context["Timestamp"] = record_header.get("Timestamp")
+        else:
+            context = {
+                "Timestamp": record_header.get("Timestamp"),
+                "Backend Start": record_header.get("File", {}).get("Backend Start"),
+                "Backend Start Epoch": record_header.get("File", {}).get("Backend Start Epoch"),
+                "PID": record_header.get("File", {}).get("PID"),
+                "Backend Type ID": r.uint_sized(context_ctrl & 0x03),
+                "Backend Type": r.string(),
+                "Database OID": r.uint_sized((context_ctrl >> 2) & 0x03),
+                "Database": r.string(),
+                "User OID": r.uint_sized((context_ctrl >> 4) & 0x03),
+                "Authenticated User": r.string(),
+                "User": r.string(),
+                "Application Name": r.string(),
+                "Client Host": r.string(),
+                "Client Port": r.string(),
+            }
+            if version >= 6:
+                cached_context = copy.deepcopy(context)
+                cached_context["Timestamp"] = None
+                templates["__context"] = cached_context
+        template_ctrl = r.u8()
+        template_mode = template_ctrl & 0x03
+        template_has_metrics = (
+            template_mode == TEMPLATE_REF and
+            (version < 5 or bool(template_ctrl & TEMPLATE_HAS_METRICS))
+        )
+        has_query_details = version < 5 or bool(template_ctrl & TEMPLATE_HAS_DETAILS)
+        plan_id = 0
+        if template_mode != TEMPLATE_NONE:
+            template_id = r.uint_sized((template_ctrl >> 2) & 0x03)
+            if version >= 8:
+                shape_hash = r.uint_sized((template_ctrl >> 4) & 0x03)
+                plan_id = shape_hash
+            elif version < 5 or template_mode == TEMPLATE_DEFINE:
+                shape_hash = r.uint_sized((template_ctrl >> 4) & 0x03)
+                plan_id = shape_hash
+            else:
+                shape_hash = 0
+        else:
+            template_id = 0
+            if version >= 8:
+                shape_hash = r.uint_sized((template_ctrl >> 4) & 0x03)
+                plan_id = shape_hash
+            else:
+                shape_hash = 0
+        query_text = r.string() if flags & FLAG_QUERY_TEXT else None
+        params = r.string() if flags & FLAG_PARAMS else None
+    else:
+        if r.u32() != PAYLOAD_MAGIC:
+            raise DecodeError("bad payload magic")
+        version = r.u16()
+        r.u16()
+        flags = r.u32()
+        duration_us = r.i64()
+        query_id = r.u64()
+        context = {
+            "Timestamp": pg_timestamp_to_iso(r.i64()),
+            "Backend Start": pg_timestamp_to_iso(r.i64()),
+            "Backend Start Epoch": r.i64(),
+            "PID": r.u32(),
+            "Backend Type ID": r.u32(),
+            "Backend Type": r.string(),
+            "Database OID": r.u32(),
+            "Database": r.string(),
+            "User OID": r.u32(),
+            "Authenticated User": r.string(),
+            "User": r.string(),
+            "Application Name": r.string(),
+            "Client Host": r.string(),
+            "Client Port": r.string(),
+        }
+        template_mode = r.u8()
+        template_has_metrics = template_mode == TEMPLATE_REF
+        has_query_details = True
+        template_id = r.u32()
+        shape_hash = r.u64()
+        plan_id = shape_hash
+        query_text = r.string()
+        params = r.string()
+
+    if template_mode == TEMPLATE_REF:
+        if template_id not in templates:
+            raise DecodeError(f"template id {template_id} referenced before definition")
+        template = templates[template_id]
+        template_plan = template["plan"] if isinstance(template, dict) else template
+        if isinstance(template, dict):
+            if shape_hash == 0:
+                shape_hash = template.get("shape_hash", shape_hash)
+            if plan_id == 0:
+                plan_id = shape_hash
+            if query_id == 0:
+                query_id = template.get("query_id", 0)
+                record_header["Query Identifier"] = query_id
+        if template_has_metrics:
+            metrics = parse_metric_node(r)
+            plan = merge_template_metrics(template_plan, metrics)
+        else:
+            plan = copy.deepcopy(template_plan)
+    else:
+        plan = parse_full_plan_node(r)
+        if template_mode == TEMPLATE_DEFINE:
+            templates[template_id] = {
+                "plan": strip_dynamic_details(plan),
+                "query_id": query_id,
+                "shape_hash": shape_hash,
+            }
+
+    query_details = []
+    if version >= 5:
+        if has_query_details:
+            query_details = parse_details(r)
+    elif version >= 3 and r.remaining() > 0:
+        query_details = parse_details(r)
+    if r.remaining() != 0:
+        raise DecodeError(f"{r.remaining()} trailing payload bytes")
+
+    out = {
+        "Record": record_header,
+        "Format Version": version,
+        "Flags": flags,
+        "Duration": duration_us / 1000.0,
+        "Query Identifier": query_id,
+        "Plan Identifier": plan_id,
+        "Log Context": context,
+        "Template": {
+            "Mode": {0: "none", 1: "define", 2: "ref"}.get(template_mode,
+                                                            str(template_mode)),
+            "ID": template_id,
+            "Shape Hash": shape_hash,
+        },
+        "Plan": apply_details(plan),
+    }
+    if template_mode == TEMPLATE_REF:
+        out["Template"]["Metrics"] = "inline" if template_has_metrics else "omitted"
+    if query_text is not None:
+        out["Query Text"] = query_text
+    if params is not None:
+        out["Query Parameters"] = params
+    for detail in query_details:
+        label = detail["label"]
+        value = detail_to_property(detail)
+        if label in out:
+            if not isinstance(out[label], list):
+                out[label] = [out[label]]
+            out[label].append(value)
+        else:
+            out[label] = value
+    return out
+
+
+def iter_records(path, verify_crc=False):
+    templates = {}
+    with open(path, "rb") as f:
+        data = f.read()
+    r = Reader(data)
+    if r.u32() != FILE_MAGIC:
+        raise DecodeError(f"{path}: bad file magic")
+    file_version = r.u16()
+    header_len = r.u16()
+
+    if file_version >= 4:
+        file_compression = r.u16()
+        file_flags = r.u16()
+        pg_version = r.u32()
+        backend_start = r.i64()
+        backend_start_epoch = r.i64()
+        pid = r.u32()
+        reserved = r.u32()
+        file_header = {
+            "Path": path,
+            "Format Version": file_version,
+            "Compression": {0: "none", 1: "lz4", 2: "zstd"}.get(file_compression,
+                                                                 str(file_compression)),
+            "File Flags": file_flags,
+            "PostgreSQL Version": pg_version,
+            "Backend Start": pg_timestamp_to_iso(backend_start),
+            "Backend Start Epoch": backend_start_epoch,
+            "PID": pid,
+            "Reserved": reserved,
+        }
+        if header_len > 40:
+            r.take(header_len - 40)
+        body = decompress_file_body(file_compression, r.take(r.remaining()))
+        br = Reader(body, version=file_version)
+        record_index = 0
+
+        while br.remaining() > 0:
+            start = br.pos
+            record_index += 1
+            ctrl1 = br.u8()
+            body_len = br.uint_sized(ctrl1 & 0x03)
+            record_body = Reader(br.take(body_len), version=file_version)
+            ctrl2 = record_body.u8()
+            if file_version >= 5:
+                record_no = record_index
+            else:
+                record_no = record_body.uint_sized((ctrl1 >> 2) & 0x03)
+            ts_delta = record_body.int_sized((ctrl1 >> 4) & 0x03)
+            duration_us = record_body.int_sized((ctrl1 >> 6) & 0x03)
+            flags = record_body.uint_sized(ctrl2 & 0x03)
+            qid_code = (ctrl2 >> 2) & 0x03
+            profile = (ctrl2 >> 4) & 0x01
+            query_id = (record_body.uint_sized(qid_code)
+                        if ctrl2 & 0x20 else 0)
+            payload = record_body.take(record_body.remaining())
+            header = {
+                "File": file_header,
+                "Offset": start,
+                "Format Version": file_version,
+                "Compression": file_header["Compression"],
+                "Profile": {0: "simple", 1: "full"}.get(profile, str(profile)),
+                "Flags": flags,
+                "Record Number": record_no,
+                "Timestamp": pg_timestamp_to_iso(
+                    backend_start + (ts_delta * 1000 if file_version >= 5 else ts_delta)
+                ),
+                "Query Identifier": query_id,
+                "Duration": duration_us / 1000.0,
+            }
+            if verify_crc:
+                raise DecodeError("--verify-crc is only available for v3 records")
+            yield parse_payload(payload, header, templates)
+        return
+
+    file_header = {
+        "Path": path,
+        "Format Version": file_version,
+        "PostgreSQL Version": r.u32(),
+        "Backend Start": pg_timestamp_to_iso(r.i64()),
+        "Reserved": r.u32(),
+    }
+    if header_len > 24:
+        r.take(header_len - 24)
+
+    while r.remaining() > 0:
+        start = r.pos
+        if r.u32() != RECORD_MAGIC:
+            raise DecodeError(f"{path}: bad record magic at offset {start}")
+        version = r.u16()
+        header_len = r.u16()
+        compression = r.u16()
+        profile = r.u16()
+        flags = r.u32()
+        header = {
+            "File": file_header,
+            "Offset": start,
+            "Format Version": version,
+            "Compression": {0: "none", 1: "lz4", 2: "zstd"}.get(compression,
+                                                                 str(compression)),
+            "Profile": {0: "simple", 1: "full"}.get(profile, str(profile)),
+            "Flags": flags,
+            "Record Number": r.u64(),
+            "Timestamp": pg_timestamp_to_iso(r.i64()),
+            "PID": r.u32(),
+            "Database OID": r.u32(),
+            "User OID": r.u32(),
+            "Uncompressed Length": r.u32(),
+            "Compressed Length": r.u32(),
+            "CRC32C": r.u32(),
+            "Query Identifier": r.u64(),
+            "Duration": r.i64() / 1000.0,
+        }
+        consumed = r.pos - start
+        if header_len > consumed:
+            r.take(header_len - consumed)
+        payload_data = r.take(header["Compressed Length"])
+        payload = decompress_payload(compression, payload_data,
+                                     header["Uncompressed Length"])
+        if len(payload) != header["Uncompressed Length"]:
+            raise DecodeError(f"{path}: decompressed length mismatch")
+        if verify_crc:
+            try:
+                import google_crc32c
+                crc = google_crc32c.value(payload)
+                if crc != header["CRC32C"]:
+                    raise DecodeError(f"{path}: CRC32C mismatch")
+            except ImportError:
+                raise DecodeError("--verify-crc requires google-crc32c")
+        yield parse_payload(payload, header, templates)
+
+
+CMD_NAMES = {
+    1: "Select",
+    2: "Update",
+    3: "Insert",
+    4: "Delete",
+    5: "Merge",
+}
+
+JOIN_NAMES = {
+    0: "Inner",
+    1: "Left",
+    2: "Full",
+    3: "Right",
+    4: "Semi",
+    5: "Anti",
+    6: "Right Semi",
+    7: "Right Anti",
+}
+
+AGG_STRATEGIES = {
+    0: ("Aggregate", "Plain"),
+    1: ("GroupAggregate", "Sorted"),
+    2: ("HashAggregate", "Hashed"),
+    3: ("MixedAggregate", "Mixed"),
+}
+
+SETOP_STRATEGIES = {
+    0: ("SetOp", "Sorted"),
+    1: ("HashSetOp", "Hashed"),
+}
+
+SETOP_COMMANDS = {
+    0: "Intersect",
+    1: "Intersect All",
+    2: "Except",
+    3: "Except All",
+}
+
+SCAN_DIRECTIONS = {
+    -1: "Backward",
+    0: "NoMovement",
+    1: "Forward",
+}
+
+
+def rounded(value, digits):
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def extra_value(node, kind, index):
+    if node.get("Extra Kind") == kind:
+        return node.get("Extra1" if index == 1 else "Extra2")
+    return None
+
+
+def scan_direction(node):
+    encoded = extra_value(node, EXTRA_INDEX_SCAN_DIRECTION, 1)
+    if encoded is None:
+        return "Forward"
+    return SCAN_DIRECTIONS.get(int(encoded) - 1, "???")
+
+
+def agg_partial_mode(aggsplit):
+    if aggsplit is None:
+        return None
+    if int(aggsplit) & 0x02:
+        return "Partial"
+    if int(aggsplit) & 0x01:
+        return "Finalize"
+    return "Simple"
+
+
+def postgres_node_names(node):
+    ntype = node.get("Node Type", "???")
+    text_name = ntype
+    json_name = ntype
+    props = {}
+
+    if ntype == "ModifyTable":
+        operation = CMD_NAMES.get(extra_value(node, EXTRA_MODIFY_OPERATION, 1),
+                                  "???")
+        props["Operation"] = operation
+        text_name = operation
+    elif ntype == "Foreign Scan":
+        operation = CMD_NAMES.get(extra_value(node, EXTRA_FOREIGN_OPERATION, 1),
+                                  "???")
+        props["Operation"] = operation
+        if operation != "Select":
+            text_name = f"Foreign {operation}"
+    elif ntype in ("Nested Loop", "Merge Join", "Hash Join"):
+        join_type = JOIN_NAMES.get(extra_value(node, EXTRA_JOIN_TYPE, 1),
+                                   "???")
+        props["Join Type"] = join_type
+        if ntype == "Nested Loop":
+            text_name = ("Nested Loop" if join_type == "Inner"
+                         else f"Nested Loop {join_type} Join")
+        elif ntype == "Merge Join":
+            text_name = ("Merge Join" if join_type == "Inner"
+                         else f"Merge {join_type} Join")
+        elif ntype == "Hash Join":
+            text_name = ("Hash Join" if join_type == "Inner"
+                         else f"Hash {join_type} Join")
+    elif ntype == "Aggregate":
+        agg = AGG_STRATEGIES.get(extra_value(node, EXTRA_AGG, 1),
+                                 ("Aggregate ???", "???"))
+        text_name, strategy = agg
+        props["Strategy"] = strategy
+        partial = agg_partial_mode(extra_value(node, EXTRA_AGG, 2))
+        if partial:
+            props["Partial Mode"] = partial
+            if partial in ("Partial", "Finalize"):
+                text_name = f"{partial} {text_name}"
+    elif ntype == "SetOp":
+        setop = SETOP_STRATEGIES.get(extra_value(node, EXTRA_SETOP, 1),
+                                     ("SetOp ???", "???"))
+        text_name, strategy = setop
+        props["Strategy"] = strategy
+        command = SETOP_COMMANDS.get(extra_value(node, EXTRA_SETOP, 2), "???")
+        props["Command"] = command
+        text_name = f"{text_name} {command}"
+
+    return json_name, text_name, props
+
+
+def add_scan_identity(out, node):
+    ntype = node.get("Node Type")
+    if ntype in ("Index Scan", "Index Only Scan"):
+        out["Scan Direction"] = scan_direction(node)
+    if node.get("Index Name"):
+        out["Index Name"] = node["Index Name"]
+    if node.get("Relation Name"):
+        out["Relation Name"] = node["Relation Name"]
+    if node.get("Schema"):
+        out["Schema"] = node["Schema"]
+    if node.get("Alias"):
+        out["Alias"] = node["Alias"]
+
+
+BUFFER_PROPERTY_ORDER = [
+    "Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+    "Shared Written Blocks", "Local Hit Blocks", "Local Read Blocks",
+    "Local Dirtied Blocks", "Local Written Blocks", "Temp Read Blocks",
+    "Temp Written Blocks",
+]
+
+BUFFER_TIMING_PROPERTY_MAP = [
+    ("Shared Read Time", "Shared I/O Read Time"),
+    ("Shared Write Time", "Shared I/O Write Time"),
+    ("Local Read Time", "Local I/O Read Time"),
+    ("Local Write Time", "Local I/O Write Time"),
+    ("Temp Read Time", "Temp I/O Read Time"),
+    ("Temp Write Time", "Temp I/O Write Time"),
+]
+
+WAL_PROPERTY_ORDER = [
+    "WAL Records", "WAL FPI", "WAL Bytes", "WAL Buffers Full",
+]
+
+
+def add_buffer_properties(out, buffers, include_io_timing=False):
+    for key in BUFFER_PROPERTY_ORDER:
+        out[key] = int(buffers.get(key, 0))
+    if include_io_timing:
+        for source, target in BUFFER_TIMING_PROPERTY_MAP:
+            out[target] = pg_numeric(buffers.get(source, 0), 3)
+
+
+def add_wal_properties(out, wal):
+    for key in WAL_PROPERTY_ORDER:
+        out[key] = int(wal.get(key, 0))
+
+
+def strip_worker_field(value):
+    value = dict(value)
+    value.pop("Worker", None)
+    return value
+
+
+def add_worker(out, worker, props):
+    workers = out.setdefault("Workers", [])
+    for entry in workers:
+        if entry.get("Worker Number") == worker:
+            entry.update(props)
+            return
+    entry = {"Worker Number": worker}
+    entry.update(props)
+    workers.append(entry)
+
+
+def add_worker_or_top_level(out, values, fields=None):
+    if not isinstance(values, list):
+        values = [values]
+
+    for value in values:
+        if not isinstance(value, dict) or "Worker" not in value:
+            out.update(value if isinstance(value, dict) else {})
+            continue
+
+        worker = int(value["Worker"])
+        props = strip_worker_field(value)
+        if fields is not None:
+            props = {key: props[key] for key in fields if key in props}
+        if worker < 0:
+            out.update(props)
+        else:
+            add_worker(out, worker, props)
+
+
+def add_incremental_sort_groups(out, values):
+    if not isinstance(values, list):
+        values = [values]
+
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+
+        worker = int(value.get("Worker", -1))
+        group_type = value.get("Group Type")
+        if not group_type:
+            continue
+
+        group = {
+            "Group Count": int(value.get("Group Count", 0)),
+            "Sort Methods Used": value.get("Sort Methods Used", []),
+        }
+
+        if int(value.get("Peak Memory", 0)) > 0:
+            space_type = value.get("Memory Space Type", "Memory")
+            group[f"Sort Space {space_type}"] = {
+                "Average Sort Space Used": int(value.get("Average Memory", 0)),
+                "Peak Sort Space Used": int(value.get("Peak Memory", 0)),
+            }
+
+        if int(value.get("Peak Disk", 0)) > 0:
+            group["Sort Space Disk"] = {
+                "Average Sort Space Used": int(value.get("Average Disk", 0)),
+                "Peak Sort Space Used": int(value.get("Peak Disk", 0)),
+            }
+
+        label = f"{group_type} Groups"
+        if worker < 0:
+            out[label] = group
+        else:
+            add_worker(out, worker, {label: group})
+
+
+PG_FLOAT_0_KEYS = {
+    "Actual Loops", "Rows Removed by Filter",
+    "Rows Removed by Join Filter", "Rows Removed by Index Recheck",
+    "Rows Removed by Conflict Filter", "Heap Fetches",
+    "Workers Planned", "Workers Launched", "Tuples Inserted",
+    "Conflicting Tuples", "Tuples Updated", "Tuples Deleted",
+    "Tuples Skipped",
+}
+
+
+def postgres_detail_value(key, value):
+    if key in PG_FLOAT_0_KEYS:
+        if isinstance(value, list):
+            return [postgres_detail_value(key, item) for item in value]
+        return pg_numeric(float(value), 0)
+    return value
+
+
+def add_postgres_property(out, key, value):
+    if key in out:
+        if not isinstance(out[key], list):
+            out[key] = [out[key]]
+        out[key].append(value)
+    else:
+        out[key] = value
+
+
+def extension_explain_properties(value):
+    props = []
+    for line in str(value).splitlines():
+        match = re.match(r"^\s*([^:\n]+):\s*(.*)$", line)
+        if not match:
+            return None
+        key, raw_value = match.group(1), match.group(2)
+        bytes_match = re.match(r"^(-?\d+)\s+b$", raw_value)
+        if bytes_match:
+            parsed_value = int(bytes_match.group(1))
+        else:
+            parsed_value = raw_value
+        props.append((key, parsed_value))
+    return props
+
+
+def postgres_trigger(trigger, record_flags=0):
+    out = {
+        "Trigger Name": trigger.get("Trigger Name", ""),
+    }
+    if trigger.get("Constraint Name"):
+        out["Constraint Name"] = trigger["Constraint Name"]
+    if trigger.get("Relation"):
+        out["Relation"] = trigger["Relation"]
+    if record_flags & FLAG_TIMING:
+        out["Time"] = pg_numeric(trigger.get("Time", 0), 3)
+    out["Calls"] = int(round(trigger.get("Calls", 0)))
+    return out
+
+
+def postgres_jit(jit, record_flags=0):
+    out = {
+        "Functions": int(jit.get("Functions", 0)),
+        "Options": jit.get("Options", {}),
+    }
+    timing = jit.get("Timing", {})
+    if (record_flags & FLAG_ANALYZE) and (record_flags & FLAG_TIMING) and timing.get("Available"):
+        out["Timing"] = {
+            "Generation": {
+                "Deform": pg_numeric(timing.get("Deform", 0), 3),
+                "Total": pg_numeric(timing.get("Generation", 0), 3),
+            },
+            "Inlining": pg_numeric(timing.get("Inlining", 0), 3),
+            "Optimization": pg_numeric(timing.get("Optimization", 0), 3),
+            "Emission": pg_numeric(timing.get("Emission", 0), 3),
+            "Total": pg_numeric(timing.get("Total", 0), 3),
+        }
+    return out
+
+
+def postgres_float(value, ndigits):
+    return rounded(value, ndigits)
+
+
+def postgres_plan_node(node, record_flags=0):
+    json_name, _text_name, props = postgres_node_names(node)
+    flags = node.get("Flags", 0)
+    timing = bool(record_flags & FLAG_TIMING)
+    out = {"Node Type": json_name}
+
+    for key, value in props.items():
+        if key not in ("Join Type", "Command"):
+            out[key] = value
+    relationship = node.get("Relationship")
+    if relationship:
+        out["Parent Relationship"] = relationship
+    if "Custom Plan Provider" in node:
+        out["Custom Plan Provider"] = node["Custom Plan Provider"]
+    out["Parallel Aware"] = bool(flags & NODE_PARALLEL_AWARE)
+    out["Async Capable"] = bool(flags & NODE_ASYNC_CAPABLE)
+    add_scan_identity(out, node)
+    for key in ("Join Type", "Command"):
+        if key in props:
+            out[key] = props[key]
+
+    out["Startup Cost"] = pg_numeric(node.get("Startup Cost", 0), 2)
+    out["Total Cost"] = pg_numeric(node.get("Total Cost", 0), 2)
+    out["Plan Rows"] = int(round(node.get("Plan Rows", 0)))
+    out["Plan Width"] = int(node.get("Plan Width", 0))
+
+    if "Actual Rows" in node or "Never Executed" in node:
+        if timing:
+            out["Actual Startup Time"] = pg_numeric(node.get("Startup Time", 0), 3)
+            out["Actual Total Time"] = pg_numeric(node.get("Total Time", 0), 3)
+        out["Actual Rows"] = pg_numeric(node.get("Actual Rows", 0), 2)
+        out["Actual Loops"] = int(round(node.get("Actual Loops", 0)))
+
+    out["Disabled"] = bool(flags & NODE_DISABLED)
+    if "Inner Unique" in node:
+        out["Inner Unique"] = bool(node["Inner Unique"])
+
+    skip = {
+        "Relationship", "Node Tag", "Node Type", "Flags", "Startup Cost",
+        "Total Cost", "Plan Rows", "Plan Width", "Startup Time",
+        "Total Time", "Actual Rows", "Actual Loops", "Never Executed",
+        "Buffers", "WAL", "Relation OID", "Index OID", "Relation Name",
+        "Schema", "Alias", "Index Name", "Plans", "Extra Kind", "Extra1",
+        "Extra2", "Inner Unique", "Custom Plan Provider",
+    }
+    for key, value in node.items():
+        if key not in skip:
+            if key == "Sort Info":
+                add_worker_or_top_level(out, value, [
+                    "Sort Method", "Sort Space Used", "Sort Space Type",
+                ])
+            elif key == "Incremental Sort Groups":
+                add_incremental_sort_groups(out, value)
+            elif key in ("Hash Info", "Storage Info", "Memoize Stats",
+                         "HashAgg Stats", "Heap Blocks"):
+                add_worker_or_top_level(out, value)
+            elif key == "Extension Explain":
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    props = extension_explain_properties(item)
+                    if props is None:
+                        add_postgres_property(out, key,
+                                              postgres_detail_value(key, item))
+                    else:
+                        for prop_key, prop_value in props:
+                            add_postgres_property(out, prop_key, prop_value)
+            else:
+                out[key] = postgres_detail_value(key, value)
+
+    if node.get("Buffers"):
+        add_buffer_properties(out, node["Buffers"])
+    if node.get("WAL"):
+        add_wal_properties(out, node["WAL"])
+
+    if ((record_flags & FLAG_ANALYZE) and
+            ("Actual Loops" in node) and
+            float(node.get("Actual Loops", 0)) > 1 and
+            ((flags & NODE_PARALLEL_AWARE) or
+             props.get("Partial Mode") == "Partial")):
+        out["Workers"] = []
+
+    children = [postgres_plan_node(c, record_flags) for c in node.get("Plans", [])]
+    if children:
+        out["Plans"] = children
+    return out
+
+
+def postgres_record(record):
+    flags = record.get("Flags", 0)
+    out = {}
+    if record.get("Query Text"):
+        out["Query Text"] = record["Query Text"]
+    if record.get("Query Parameters"):
+        out["Query Parameters"] = record["Query Parameters"]
+    out["Plan"] = postgres_plan_node(record["Plan"], flags)
+    if (flags & FLAG_VERBOSE) and record.get("Query Identifier"):
+        out["Query Identifier"] = pg_int64(record["Query Identifier"])
+    if "Planning" in record:
+        planning = {}
+        add_buffer_properties(planning, record["Planning"])
+        out["Planning"] = planning
+    if "Trigger" in record:
+        triggers = record["Trigger"]
+        if not isinstance(triggers, list):
+            triggers = [triggers]
+        out["Triggers"] = [
+            postgres_trigger(trigger, flags)
+            for trigger in triggers
+        ]
+    elif flags & FLAG_ANALYZE:
+        out["Triggers"] = []
+    if "JIT" in record:
+        out["JIT"] = postgres_jit(record["JIT"], flags)
+    return out
+
+
+def postgres_records(records):
+    return [postgres_record(r) for r in records]
+
+
+def plan_line(node, timing=False):
+    flags = node.get("Flags", 0)
+    _json_name, name, _props = postgres_node_names(node)
+    if node.get("Node Type") == "Custom Scan" and node.get("Custom Plan Provider"):
+        name += f" ({node['Custom Plan Provider']})"
+    if flags & NODE_PARALLEL_AWARE:
+        name = "Parallel " + name
+    if flags & NODE_ASYNC_CAPABLE:
+        name = "Async " + name
+    if node.get("Node Type") in ("Index Scan", "Index Only Scan"):
+        direction = scan_direction(node)
+        if direction == "Backward":
+            name += " Backward"
+    if node.get("Index Name"):
+        if node.get("Node Type") == "Bitmap Index Scan":
+            name += f" on {node['Index Name']}"
+        else:
+            name += f" using {node['Index Name']}"
+    if node.get("Relation Name"):
+        relname = node["Relation Name"]
+        if node.get("Schema"):
+            relname = f"{node['Schema']}.{relname}"
+        name += f" on {relname}"
+        if node.get("Alias") and node["Alias"] != node["Relation Name"]:
+            name += f" {node['Alias']}"
+    cost = (
+        f"(cost={node.get('Startup Cost', 0):.2f}.."
+        f"{node.get('Total Cost', 0):.2f} rows={node.get('Plan Rows', 0):.0f} "
+        f"width={node.get('Plan Width', 0)})"
+    )
+    if "Actual Rows" in node:
+        if timing:
+            actual = (
+                f" (actual time={node.get('Startup Time', 0):.3f}.."
+                f"{node.get('Total Time', 0):.3f} rows={node.get('Actual Rows', 0):.2f} "
+                f"loops={node.get('Actual Loops', 0):.0f})"
+            )
+        else:
+            actual = (
+                f" (actual rows={node.get('Actual Rows', 0):.2f} "
+                f"loops={node.get('Actual Loops', 0):.0f})"
+            )
+    elif node.get("Never Executed"):
+        actual = " (never executed)"
+    else:
+        actual = ""
+    return f"{name}  {cost}{actual}"
+
+
+TEXT_DETAIL_ORDER = [
+    "Output", "Inner Unique", "Index Cond", "Recheck Cond", "TID Cond", "Order By",
+    "Hash Cond", "Merge Cond", "Join Filter", "Filter", "One-Time Filter",
+    "Run Condition", "Rows Removed by Filter",
+    "Rows Removed by Join Filter", "Rows Removed by Index Recheck",
+    "Rows Removed by Conflict Filter", "Sort Key", "Presorted Key",
+    "Group Key", "Hash Key", "Heap Fetches", "Workers Planned",
+    "Workers Launched", "Single Copy", "Index Searches", "Subplans Removed",
+    "Cache Key", "Cache Mode", "Conflict Resolution",
+    "Conflict Arbiter Index", "Conflict Filter", "Merge Actions",
+]
+
+
+def render_value_text(label, value):
+    if label.startswith("Rows Removed by"):
+        return f"{float(value):.0f}"
+    if label in ("Heap Fetches", "Workers Planned", "Workers Launched",
+                 "Index Searches", "Subplans Removed"):
+        return f"{float(value):.0f}"
+    if isinstance(value, list):
+        if value and all(isinstance(v, str) for v in value):
+            return ", ".join(value)
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        if label == "Sort Info":
+            return (f"Sort Method: {value['Sort Method']}  "
+                    f"{value['Sort Space Type']}: {value['Sort Space Used']}kB")
+        if label == "Hash Info":
+            if (value["Hash Buckets"] != value["Original Hash Buckets"] or
+                    value["Hash Batches"] != value["Original Hash Batches"]):
+                return (f"Buckets: {value['Hash Buckets']} "
+                        f"(originally {value['Original Hash Buckets']})  "
+                        f"Batches: {value['Hash Batches']} "
+                        f"(originally {value['Original Hash Batches']})  "
+                        f"Memory Usage: {value['Peak Memory Usage']}kB")
+            return (f"Buckets: {value['Hash Buckets']}  "
+                    f"Batches: {value['Hash Batches']}  "
+                    f"Memory Usage: {value['Peak Memory Usage']}kB")
+        if label == "Storage Info":
+            return (f"Storage: {value['Storage']}  "
+                    f"Maximum Storage: {value['Maximum Storage']}kB")
+        if label == "Heap Blocks":
+            parts = []
+            if value.get("Exact Heap Blocks", 0) > 0:
+                parts.append(f"exact={int(value['Exact Heap Blocks'])}")
+            if value.get("Lossy Heap Blocks", 0) > 0:
+                parts.append(f"lossy={int(value['Lossy Heap Blocks'])}")
+            return " ".join(parts)
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def format_buffers_text(buffers):
+    has_shared = any(buffers.get(key, 0) > 0 for key in (
+        "Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+        "Shared Written Blocks",
+    ))
+    has_local = any(buffers.get(key, 0) > 0 for key in (
+        "Local Hit Blocks", "Local Read Blocks", "Local Dirtied Blocks",
+        "Local Written Blocks",
+    ))
+    has_temp = any(buffers.get(key, 0) > 0 for key in (
+        "Temp Read Blocks", "Temp Written Blocks",
+    ))
+
+    if not (has_shared or has_local or has_temp):
+        return None
+
+    parts = ["Buffers:"]
+    if has_shared:
+        chunk = ["shared"]
+        for label, key in (
+            ("hit", "Shared Hit Blocks"),
+            ("read", "Shared Read Blocks"),
+            ("dirtied", "Shared Dirtied Blocks"),
+            ("written", "Shared Written Blocks"),
+        ):
+            if buffers.get(key, 0) > 0:
+                chunk.append(f"{label}={int(buffers[key])}")
+        parts.append(" ".join(chunk) + ("," if has_local or has_temp else ""))
+    if has_local:
+        chunk = ["local"]
+        for label, key in (
+            ("hit", "Local Hit Blocks"),
+            ("read", "Local Read Blocks"),
+            ("dirtied", "Local Dirtied Blocks"),
+            ("written", "Local Written Blocks"),
+        ):
+            if buffers.get(key, 0) > 0:
+                chunk.append(f"{label}={int(buffers[key])}")
+        parts.append(" ".join(chunk) + ("," if has_temp else ""))
+    if has_temp:
+        chunk = ["temp"]
+        for label, key in (
+            ("read", "Temp Read Blocks"),
+            ("written", "Temp Written Blocks"),
+        ):
+            if buffers.get(key, 0) > 0:
+                chunk.append(f"{label}={int(buffers[key])}")
+        parts.append(" ".join(chunk))
+    return " ".join(parts)
+
+
+def format_io_timings_text(buffers):
+    groups = [
+        ("shared", [("read", "Shared Read Time"),
+                    ("write", "Shared Write Time")]),
+        ("local", [("read", "Local Read Time"),
+                   ("write", "Local Write Time")]),
+        ("temp", [("read", "Temp Read Time"),
+                  ("write", "Temp Write Time")]),
+    ]
+    chunks = []
+    for group, entries in groups:
+        chunk = [group]
+        for label, key in entries:
+            if buffers.get(key, 0) > 0:
+                chunk.append(f"{label}={buffers[key]:.3f}")
+        if len(chunk) > 1:
+            chunks.append(" ".join(chunk))
+    if not chunks:
+        return None
+    return "I/O Timings: " + ", ".join(chunks)
+
+
+def format_wal_text(wal):
+    parts = ["WAL:"]
+    for label, key in (
+        ("records", "WAL Records"),
+        ("fpi", "WAL FPI"),
+        ("bytes", "WAL Bytes"),
+        ("buffers full", "WAL Buffers Full"),
+    ):
+        if wal.get(key, 0) > 0:
+            parts.append(f"{label}={int(wal[key])}")
+    if len(parts) == 1:
+        return None
+    return " ".join(parts)
+
+
+def render_plan_text(node, record_flags=0, indent=0):
+    prefix = " " * indent
+    detail_indent = indent + (2 if indent == 0 else 6)
+    detail_prefix = " " * detail_indent
+    child_indent = detail_indent
+    timing = bool(record_flags & FLAG_TIMING)
+    lines = [prefix + ("->  " if indent else "") + plan_line(node, timing)]
+    for label in TEXT_DETAIL_ORDER:
+        if label not in node:
+            continue
+        if label == "Inner Unique":
+            if not ((record_flags & FLAG_VERBOSE) and node[label]):
+                continue
+        if label == "Single Copy" and not node[label]:
+            continue
+        values = node[label]
+        if not isinstance(values, list) or (values and isinstance(values[0], str)):
+            values = [values]
+        for value in values:
+            if label.startswith("Rows Removed by") and float(value) <= 0:
+                continue
+            if label in ("Sort Info", "Hash Info", "Storage Info"):
+                lines.append(detail_prefix + render_value_text(label, value))
+            else:
+                lines.append(detail_prefix + f"{label}: {render_value_text(label, value)}")
+    for label in ("Sort Info", "Hash Info", "Storage Info", "Heap Blocks",
+                  "Memoize Stats", "HashAgg Stats",
+                  "Incremental Sort Groups", "Conflict Tuples", "Merge Tuples"):
+        if label not in node:
+            continue
+        values = node[label]
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            rendered = render_value_text(label, value)
+            if label == "Heap Blocks" and rendered == "":
+                continue
+            if label in ("Sort Info", "Hash Info", "Storage Info"):
+                lines.append(detail_prefix + rendered)
+            else:
+                lines.append(detail_prefix + f"{label}: {rendered}")
+    if "Extension Explain" in node:
+        values = node["Extension Explain"]
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            for line in str(value).splitlines():
+                lines.append(detail_prefix + line)
+    if node.get("Flags", 0) & NODE_DISABLED:
+        lines.append(detail_prefix + "Disabled: true")
+    if node.get("Buffers"):
+        bufline = format_buffers_text(node["Buffers"])
+        if bufline:
+            lines.append(detail_prefix + bufline)
+        ioline = format_io_timings_text(node["Buffers"])
+        if ioline:
+            lines.append(detail_prefix + ioline)
+    if node.get("WAL"):
+        walline = format_wal_text(node["WAL"])
+        if walline:
+            lines.append(detail_prefix + walline)
+    for child in node.get("Plans", []):
+        lines.extend(render_plan_text(child, record_flags, child_indent))
+    return lines
+
+
+def render_planning_text(planning):
+    lines = ["Planning:"]
+    bufline = format_buffers_text(planning)
+    if bufline:
+        lines.append("  " + bufline)
+    ioline = format_io_timings_text(planning)
+    if ioline:
+        lines.append("  " + ioline)
+    return lines
+
+
+def render_text(records):
+    chunks = []
+    for rec in records:
+        ctx = rec.get("Log Context", {})
+        header = (
+            f"{ctx.get('Timestamp') or rec['Record'].get('Timestamp')} "
+            f"pid={ctx.get('PID')} user={ctx.get('User')} "
+            f"db={ctx.get('Database')} app={ctx.get('Application Name')} "
+            f"queryid={rec.get('Query Identifier')} "
+            f"duration={rec.get('Duration'):.3f} ms"
+        )
+        lines = [header]
+        if rec.get("Query Text"):
+            lines.append("Query Text: " + rec["Query Text"])
+        if rec.get("Query Parameters"):
+            lines.append("Query Parameters: " + rec["Query Parameters"])
+        lines.extend(render_plan_text(rec["Plan"], rec.get("Flags", 0)))
+        if rec.get("Planning"):
+            lines.extend(render_planning_text(rec["Planning"]))
+        triggers = rec.get("Trigger")
+        if triggers:
+            if not isinstance(triggers, list):
+                triggers = [triggers]
+            for trig in triggers:
+                name = trig.get("Trigger Name") or "Trigger"
+                rel = f" on {trig['Relation']}" if trig.get("Relation") else ""
+                con = (f" for constraint {trig['Constraint Name']}"
+                       if trig.get("Constraint Name") else "")
+                lines.append(
+                    f"Trigger {name}{con}{rel}: time={trig.get('Time', 0):.3f} "
+                    f"calls={trig.get('Calls', 0):.0f}"
+                )
+        if rec.get("JIT"):
+            jit = rec["JIT"]
+            lines.append("JIT:")
+            lines.append(f"  Functions: {jit.get('Functions')}")
+            opts = jit.get("Options", {})
+            lines.append(
+                "  Options: "
+                f"Inlining {'true' if opts.get('Inlining') else 'false'}, "
+                f"Optimization {'true' if opts.get('Optimization') else 'false'}, "
+                f"Expressions {'true' if opts.get('Expressions') else 'false'}, "
+                f"Deforming {'true' if opts.get('Deforming') else 'false'}"
+            )
+            timing = jit.get("Timing", {})
+            if timing.get("Available"):
+                lines.append(
+                    "  Timing: "
+                    f"Generation {timing.get('Generation', 0):.3f} ms "
+                    f"(Deform {timing.get('Deform', 0):.3f} ms), "
+                    f"Inlining {timing.get('Inlining', 0):.3f} ms, "
+                    f"Optimization {timing.get('Optimization', 0):.3f} ms, "
+                    f"Emission {timing.get('Emission', 0):.3f} ms, "
+                    f"Total {timing.get('Total', 0):.3f} ms"
+                )
+        chunks.append("\n".join(lines))
+    return "\n\n".join(chunks)
+
+
+def render_postgres_text(records):
+    chunks = []
+    for rec in records:
+        lines = []
+        if rec.get("Query Text"):
+            lines.append("Query Text: " + rec["Query Text"])
+        if rec.get("Query Parameters"):
+            lines.append("Query Parameters: " + rec["Query Parameters"])
+        lines.extend(render_plan_text(rec["Plan"], rec.get("Flags", 0)))
+        if (rec.get("Flags", 0) & FLAG_VERBOSE) and rec.get("Query Identifier"):
+            lines.append(f"Query Identifier: {pg_int64(rec['Query Identifier'])}")
+        if rec.get("Planning"):
+            lines.extend(render_planning_text(rec["Planning"]))
+        triggers = rec.get("Trigger")
+        if triggers:
+            if not isinstance(triggers, list):
+                triggers = [triggers]
+            for trig in triggers:
+                name = trig.get("Trigger Name") or "Trigger"
+                rel = f" on {trig['Relation']}" if trig.get("Relation") else ""
+                con = (f" for constraint {trig['Constraint Name']}"
+                       if trig.get("Constraint Name") else "")
+                if rec.get("Flags", 0) & FLAG_TIMING:
+                    lines.append(
+                        f"Trigger {name}{con}{rel}: time={trig.get('Time', 0):.3f} "
+                        f"calls={trig.get('Calls', 0):.0f}"
+                    )
+                else:
+                    lines.append(
+                        f"Trigger {name}{con}{rel}: calls={trig.get('Calls', 0):.0f}"
+                    )
+        if rec.get("JIT"):
+            jit = rec["JIT"]
+            lines.append("JIT:")
+            lines.append(f"  Functions: {jit.get('Functions')}")
+            opts = jit.get("Options", {})
+            lines.append(
+                "  Options: "
+                f"Inlining {'true' if opts.get('Inlining') else 'false'}, "
+                f"Optimization {'true' if opts.get('Optimization') else 'false'}, "
+                f"Expressions {'true' if opts.get('Expressions') else 'false'}, "
+                f"Deforming {'true' if opts.get('Deforming') else 'false'}"
+            )
+            timing = jit.get("Timing", {})
+            if timing.get("Available"):
+                lines.append(
+                    "  Timing: "
+                    f"Generation {timing.get('Generation', 0):.3f} ms "
+                    f"(Deform {timing.get('Deform', 0):.3f} ms), "
+                    f"Inlining {timing.get('Inlining', 0):.3f} ms, "
+                    f"Optimization {timing.get('Optimization', 0):.3f} ms, "
+                    f"Emission {timing.get('Emission', 0):.3f} ms, "
+                    f"Total {timing.get('Total', 0):.3f} ms"
+                )
+        chunks.append("\n".join(lines))
+    return "\n\n".join(chunks)
+
+
+def yaml_scalar(value):
+    if isinstance(value, PGNumeric):
+        return str(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def json_scalar(value):
+    if isinstance(value, PGNumeric):
+        return str(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def json_scalar_list(value):
+    return "[" + ", ".join(json_scalar(item) for item in value) + "]"
+
+
+def render_json_value(value, indent=0, key=None):
+    pad = " " * (2 * indent)
+    if isinstance(value, dict):
+        if not value:
+            return ["{}"]
+        lines = ["{"]
+        items = list(value.items())
+        for idx, (child_key, child_value) in enumerate(items):
+            rendered = render_json_value(child_value, indent + 1, child_key)
+            comma = "," if idx < len(items) - 1 else ""
+            first = (
+                " " * (2 * (indent + 1)) +
+                json.dumps(str(child_key), ensure_ascii=False) + ": " +
+                rendered[0]
+            )
+            lines.append(first)
+            lines.extend(rendered[1:])
+            if comma:
+                lines[-1] += comma
+        lines.append(pad + "}")
+        return lines
+
+    if isinstance(value, list):
+        if not value or any(isinstance(item, (dict, list)) for item in value) or key in (
+                "Plans", "Triggers", "Workers"):
+            lines = ["["]
+            for idx, item in enumerate(value):
+                rendered = render_json_value(item, indent + 1, key)
+                comma = "," if idx < len(value) - 1 else ""
+                lines.append(" " * (2 * (indent + 1)) + rendered[0])
+                lines.extend(rendered[1:])
+                if comma:
+                    lines[-1] += comma
+            lines.append(pad + "]")
+            return lines
+        return [json_scalar_list(value)]
+
+    return [json_scalar(value)]
+
+
+def render_json(records):
+    return "\n".join(render_json_value(records, 0))
+
+
+def yaml_render_mapping_item(key, value, indent, prefix=""):
+    pad = " " * indent
+    label = f"{prefix}{key}: "
+    if isinstance(value, dict):
+        lines = [pad + label]
+        lines.extend(render_yaml_obj(value, indent + (4 if prefix else 2)))
+        return lines
+    if isinstance(value, list):
+        lines = [pad + label]
+        lines.extend(render_yaml_obj(value, indent + (4 if prefix else 2)))
+        return lines
+    return [pad + label + yaml_scalar(value)]
+
+
+def render_yaml_dict(obj, indent=0, first_prefix=None):
+    lines = []
+    items = list(obj.items())
+    for idx, (key, value) in enumerate(items):
+        prefix = first_prefix if idx == 0 and first_prefix is not None else ""
+        key_indent = indent if prefix or first_prefix is None else indent + 2
+        if prefix and isinstance(value, (dict, list)):
+            lines.extend(yaml_render_mapping_item(key, value, key_indent, prefix))
+        elif prefix:
+            lines.extend(yaml_render_mapping_item(key, value, key_indent, prefix))
+        else:
+            lines.extend(yaml_render_mapping_item(key, value, key_indent))
+    return lines
+
+
+def render_yaml_obj(obj, indent=0):
+    pad = " " * indent
+    lines = []
+    if isinstance(obj, dict):
+        lines.extend(render_yaml_dict(obj, indent))
+    elif isinstance(obj, list):
+        for value in obj:
+            if isinstance(value, dict):
+                if value:
+                    lines.extend(render_yaml_dict(value, indent, "- "))
+                else:
+                    lines.append(f"{pad}- ")
+            elif isinstance(value, list):
+                lines.append(f"{pad}- ")
+                lines.extend(render_yaml_obj(value, indent + 2))
+            else:
+                lines.append(f"{pad}- {yaml_scalar(value)}")
+    else:
+        lines.append(f"{pad}{yaml_scalar(obj)}")
+    return lines
+
+
+def render_yaml(records):
+    return "\n".join(render_yaml_obj(records))
+
+
+def xml_tag_name(key):
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", str(key))
+
+
+def xml_scalar(value):
+    if value is None:
+        text = ""
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value)
+    return html.escape(text, quote=False).replace("\r", "&#x0d;")
+
+
+def xml_item_tag(parent_key):
+    return {
+        "Plans": "Plan",
+        "Triggers": "Trigger",
+        "Workers": "Worker",
+    }.get(parent_key, "Item")
+
+
+def render_xml_value(key, value, indent):
+    tag = xml_tag_name(key)
+    pad = " " * (2 * indent)
+
+    if isinstance(value, dict):
+        lines = [f"{pad}<{tag}>"]
+        for child_key, child_value in value.items():
+            lines.extend(render_xml_value(child_key, child_value, indent + 1))
+        lines.append(f"{pad}</{tag}>")
+        return lines
+
+    if isinstance(value, list):
+        lines = [f"{pad}<{tag}>"]
+        item_tag = xml_item_tag(key)
+        for item in value:
+            if isinstance(item, dict):
+                lines.append(f"{' ' * (2 * (indent + 1))}<{item_tag}>")
+                for child_key, child_value in item.items():
+                    lines.extend(render_xml_value(child_key, child_value, indent + 2))
+                lines.append(f"{' ' * (2 * (indent + 1))}</{item_tag}>")
+            else:
+                lines.append(
+                    f"{' ' * (2 * (indent + 1))}<Item>{xml_scalar(item)}</Item>"
+                )
+        lines.append(f"{pad}</{tag}>")
+        return lines
+
+    return [f"{pad}<{tag}>{xml_scalar(value)}</{tag}>"]
+
+
+def render_xml(records):
+    lines = ['<explain xmlns="http://www.postgresql.org/2009/explain">']
+    for record in records:
+        lines.append("  <Query>")
+        for key, value in record.items():
+            lines.extend(render_xml_value(key, value, 2))
+        lines.append("  </Query>")
+    lines.append("</explain>")
+    return "\n".join(lines)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description="Decode auto_explain_z binary logs")
+    parser.add_argument("-f", "--format",
+                        choices=("text", "json", "yaml", "xml"),
+                        default="text")
+    parser.add_argument("--verify-crc", action="store_true",
+                        help="verify v3 per-record payload CRC32C using google-crc32c")
+    parser.add_argument("--raw", action="store_true",
+                        help="emit AEZ diagnostic records instead of PostgreSQL-style EXPLAIN output")
+    parser.add_argument("files", nargs="+")
+    args = parser.parse_args(argv)
+
+    records = []
+    for path in args.files:
+        records.extend(iter_records(path, verify_crc=args.verify_crc))
+
+    output_records = records if args.raw else postgres_records(records)
+
+    if args.format == "json":
+        if args.raw:
+            print(json.dumps(output_records, ensure_ascii=False, indent=2))
+        else:
+            print(render_json(output_records))
+    elif args.format == "yaml":
+        print(render_yaml(output_records))
+    elif args.format == "xml":
+        print(render_xml(output_records))
+    elif args.raw:
+        print(render_text(records))
+    else:
+        print(render_postgres_text(records))
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except DecodeError as e:
+        print(f"auto_explain_z_dump: {e}", file=sys.stderr)
+        sys.exit(1)

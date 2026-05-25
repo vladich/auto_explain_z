@@ -1,0 +1,156 @@
+auto_explain_z
+==============
+
+auto_explain_z is a standalone executor hook module for writing sampled
+execution plans to separate binary files. It intentionally does not use
+PostgreSQL's regular log path for plan payloads.
+
+Load it with session_preload_libraries, shared_preload_libraries, or LOAD:
+
+    LOAD 'auto_explain_z';
+    SET auto_explain_z.log_min_duration = 0;
+
+Binary files are written per backend to auto_explain_z.directory, which
+defaults to auto_explain_z below the data directory. The "simple" profile is a
+compact binary plan tree with costs, optional execution stats, optional
+buffer/WAL counters, query identity, and optional query text. The "full"
+profile adds binary-coded EXPLAIN detail fields such as output expressions,
+quals, join/hash/merge conditions, scan/index/TID conditions, sort/group/hash
+keys, and rows-removed counters.
+FDW, direct foreign modify, foreign modify, and custom scan EXPLAIN callbacks
+are captured as text side-channel details, because PostgreSQL exposes those
+extension points as arbitrary formatter output rather than typed plan fields.
+
+The format is versioned at the file level and record-oriented:
+
+* file header: magic, format version, file compression method, PostgreSQL
+  version, backend start time, backend start epoch, and backend pid
+* file body: one compressed stream when compression is enabled; individual
+  records are not compressed independently
+* record header: compact size-control bytes, implicit record number,
+  millisecond timestamp delta from backend start, profile, query flags,
+  optional query id, duration, and payload length
+* payload: compact log context, template metadata, and either a recursive full
+  plan tree or a recursive per-execution metrics tree, followed by query-level
+  details
+
+Internal records and payloads do not carry per-record magic numbers or format
+versions. Small integer fields use size-control bits and are stored as 1, 2,
+4, or 8 bytes as needed.
+
+The payload log context preserves the useful parts of regular log-line
+metadata without writing to the regular log path: backend type, database
+OID/name, effective user OID/name, authenticated user name, application name,
+and client host/port when present. Timestamp and pid live in the compact
+record/file headers. Format v6 stores the first full context in each file and
+lets later records reference it while it remains unchanged.
+Format v7 adds compact node bits for PostgreSQL's Disabled flag and stores
+index scan direction only for index scan nodes. Format v8 stores a Plan
+Identifier on every record, using the structural plan shape hash, so records
+can be grouped by plan without first resolving template references.
+
+Template compression is controlled by:
+
+* auto_explain_z.template_cache: enable the per-backend template dictionary
+* auto_explain_z.template_fast_path: after a query id has a template, allow
+  simple metric-free references without hashing the whole plan every time; the
+  cached plan pointer is part of the fast-path key
+* auto_explain_z.template_fast_path_recheck: executions between safety rechecks
+  of the query-id fast path; default 0 disables periodic rechecks
+* auto_explain_z.max_templates: cap unique templates per backend per file
+* auto_explain_z.template_min_plan_bytes: only template plans above this size
+  (default 0, so repeated small plan shapes can be templated)
+* auto_explain_z.template_omit_query_text: store query text on template
+  definition records, but omit it from later template-reference records
+
+Templates are keyed by query id plus a structural plan-shape hash. The hash
+includes relation/index identity, node type hierarchy, relevant plan options,
+and full-profile expression trees where those would affect reconstructed
+EXPLAIN output. The dictionary resets when a backend rotates to a new binary
+file, so every template reference is resolvable from records in the same file.
+Template definition records store template_id, plan identifier, optional query
+text, query id, and the full static plan tree. Template-reference records store
+template_id, plan identifier, and optional per-execution sections; only query id
+is recovered from the template definition when omitted from the ref record.
+When runtime metrics are present, refs also carry a metrics-only tree in the
+same node order, and the decoder overlays it on the cached static tree. Simple
+profile records without ANALYZE omit that metrics tree entirely, so repeated
+executions do not repeat relation names, index names, quals, sort/group/hash
+keys, estimates, or other static EXPLAIN details.
+
+Retention cleanup is opportunistic and runs when a backend opens or rotates a
+binary log file:
+
+* auto_explain_z.retention_max_files: maximum matching .aez files to keep
+* auto_explain_z.retention_max_size: maximum total matching .aez bytes to keep
+* auto_explain_z.retention_cleanup_interval: minimum time between scans
+
+Retention is disabled by default. Cleanup only considers files in
+auto_explain_z.directory whose names match auto_explain_z.file_prefix and end
+in .aez, and it does not remove the file currently open by the backend doing
+the cleanup.
+
+Writes are batched per backend before they enter the compression/file-write
+path. auto_explain_z.pending_buffer_size controls this pending buffer in KiB
+and defaults to 1024. Set it to 0 to disable pending buffering and flush every
+record immediately.
+
+Decode logs with auto_explain_z_dump:
+
+    auto_explain_z_dump --format text path/to/file.aez
+    auto_explain_z_dump --format json path/to/file.aez
+    auto_explain_z_dump --format yaml path/to/file.aez
+    auto_explain_z_dump --format xml path/to/file.aez
+
+The decoder resolves template-reference records using prior template
+definition records from the same file. lz4 and zstd files require either the
+corresponding Python module or an available command-line decompressor.
+By default, decoded output is normalized to PostgreSQL-style EXPLAIN fields.
+Use --raw to inspect the AEZ record headers, log context, template metadata,
+and other diagnostic fields preserved in the binary stream.
+
+Benchmark auto_explain_z against contrib/auto_explain with pgbench:
+
+    auto_explain_z_bench --build-contrib --scale 10 --clients 8 --duration 30 \
+        --iterations 3 --workloads select-only,simple-update,tpcb-like
+
+    auto_explain_z_bench --scale 3 --clients 4 --duration 2 \
+        --workloads shape-simple-point,shape-simple-range,shape-join-agg,shape-complex,shape-very-complex \
+        --auto-explain-formats text,json,yaml,xml \
+        --aez-profiles simple,full --compressions none,lz4,zstd \
+        --template-modes on,off
+
+The benchmark creates a temporary cluster, initializes pgbench, restarts the
+server for baseline, auto_explain, and auto_explain_z scenarios, and reports
+mean pgbench throughput/latency, throughput standard deviation, sampled server
+CPU percentage, regular-log bytes, binary-log bytes, and plan-log bytes per
+transaction. By default it uses pgbench's select-only workload and compares
+regular text auto_explain output against the simple auto_explain_z profile.
+Built-in pgbench workloads are select-only, simple-update, and tpcb-like. The
+shape-* workloads create additional indexed lookup, range aggregate, join,
+complex CTE/aggregate, and very complex CTE/window/join plans.
+Use --aez-profiles, --workloads, --iterations, --analyze, --buffers,
+--compression, --compressions, --template-cache, --template-modes,
+--auto-explain-format, and --auto-explain-formats to compare other logging
+modes and matrices.
+
+Compression defaults to lz4 when PostgreSQL is built with lz4 support, and to
+none otherwise. zstd is available when PostgreSQL is built with zstd support.
+
+Current scope
+-------------
+
+This module is deliberately separate from contrib/auto_explain. It installs
+its own executor hooks, owns the auto_explain_z GUC namespace, and writes plan
+payloads only to its binary files.
+
+The simple profile is intended as the low-overhead baseline. The full profile
+duplicates the core EXPLAIN walk for common plan details while keeping the
+on-disk representation binary-first. It emits the common core runtime side
+channels: trigger and JIT summaries, sort and incremental sort stats, hash and
+hash aggregate stats, memoize stats, tuplestore storage stats, index search
+counts, bitmap heap block counts, ModifyTable conflict/MERGE counters, and
+runtime subplan pruning counts. MERGE action summaries are emitted as static
+details. FDW/custom EXPLAIN callback output is included as compressed text
+details; callback failures during logging are captured as text details instead
+of aborting the completed query.

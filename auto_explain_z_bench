@@ -1,0 +1,1309 @@
+#!/usr/bin/env python3
+#
+# Run pgbench scenarios comparing regular auto_explain log output with
+# auto_explain_z binary output.
+#
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import shutil
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class BenchError(Exception):
+    pass
+
+
+BUILTIN_WORKLOAD_OPTIONS = {
+    "select-only": ["-S"],
+    "simple-update": ["-N"],
+    "tpcb-like": [],
+}
+
+
+CUSTOM_WORKLOADS = {
+    "shape-simple-point": r"""
+\set aid random(1, :naccounts)
+SELECT abalance
+FROM pgbench_accounts
+WHERE aid = :aid;
+""",
+    "shape-simple-range": r"""
+\set lo random(1, :naccounts - 1000)
+SELECT count(*), sum(abalance)
+FROM pgbench_accounts
+WHERE aid BETWEEN :lo AND :lo + 999;
+""",
+    "shape-join-agg": r"""
+\set cid random(1, :aez_customers - 200)
+SELECT c.region, count(*), sum(o.amount)
+FROM aez_order o
+JOIN aez_customer c ON c.id = o.customer_id
+WHERE o.customer_id BETWEEN :cid AND :cid + 199
+  AND o.status IN ('paid', 'open')
+  AND c.active
+GROUP BY c.region
+ORDER BY c.region;
+""",
+    "shape-complex": r"""
+\set cid random(1, :aez_customers - 1000)
+WITH regional_totals AS (
+    SELECT c.region, o.customer_id, sum(o.amount) AS total_amount,
+           count(*) AS order_count
+    FROM aez_order o
+    JOIN aez_customer c ON c.id = o.customer_id
+    WHERE o.customer_id BETWEEN :cid AND :cid + 999
+      AND o.status IN ('paid', 'open')
+      AND c.active
+    GROUP BY c.region, o.customer_id
+)
+SELECT region, count(*), sum(total_amount), avg(order_count)
+FROM regional_totals
+WHERE total_amount > 1000
+GROUP BY region
+ORDER BY region;
+""",
+    "shape-very-complex": r"""
+\set cid random(1, :aez_customers - 1500)
+WITH filtered_orders AS MATERIALIZED (
+    SELECT o.id, o.customer_id, c.region, o.status, o.amount, o.created_at
+    FROM aez_order o
+    JOIN aez_customer c ON c.id = o.customer_id
+    WHERE o.customer_id BETWEEN :cid AND :cid + 1499
+      AND o.status IN ('paid', 'open')
+      AND c.active
+),
+event_rollup AS (
+    SELECT e.order_id, count(*) AS event_count, sum(e.value) AS event_value
+    FROM aez_event e
+    JOIN filtered_orders fo ON fo.id = e.order_id
+    WHERE e.event_type <> 'ignore'
+    GROUP BY e.order_id
+),
+ranked AS (
+    SELECT fo.region, fo.status, fo.customer_id,
+           fo.amount + coalesce(er.event_value, 0) AS total_score,
+           coalesce(er.event_count, 0) AS event_count,
+           row_number() OVER (
+               PARTITION BY fo.region, fo.status
+               ORDER BY fo.amount DESC, fo.created_at DESC
+           ) AS rn
+    FROM filtered_orders fo
+    LEFT JOIN event_rollup er ON er.order_id = fo.id
+    WHERE EXISTS (
+        SELECT 1
+        FROM aez_customer c2
+        WHERE c2.id = fo.customer_id
+          AND c2.active
+    )
+)
+SELECT region, status, count(*), sum(total_score), avg(event_count), max(rn)
+FROM ranked
+WHERE rn <= 20
+GROUP BY region, status
+ORDER BY region, status;
+""",
+    "shape-node-suite": [
+        ("point", r"""
+\set aid random(1, :naccounts)
+SET enable_seqscan = off;
+SELECT abalance
+FROM pgbench_accounts
+WHERE aid = :aid;
+RESET enable_seqscan;
+"""),
+        ("range", r"""
+\set lo random(1, :naccounts - 1000)
+SELECT count(*), sum(abalance)
+FROM pgbench_accounts
+WHERE aid BETWEEN :lo AND :lo + 999;
+"""),
+        ("bitmap", r"""
+\set aval random(1, 999)
+\set bval random(1, 999)
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*)
+FROM aez_bitmap
+WHERE a = :aval OR b = :bval;
+SELECT count(*)
+FROM aez_bitmap
+WHERE a = :aval AND b = :bval;
+RESET enable_indexscan;
+RESET enable_seqscan;
+"""),
+        ("tid-sample", r"""
+SET enable_seqscan = off;
+SELECT aid
+FROM pgbench_accounts
+WHERE ctid = '(0,1)'::tid;
+SELECT count(*)
+FROM pgbench_accounts
+WHERE ctid >= '(0,1)'::tid AND ctid < '(0,20)'::tid;
+RESET enable_seqscan;
+SELECT count(*)
+FROM pgbench_accounts TABLESAMPLE SYSTEM (1);
+"""),
+        ("values-function-cte", r"""
+SELECT * FROM (VALUES (1), (2), (3)) v(x);
+SELECT * FROM generate_series(1, 8) g;
+SELECT generate_series(1, 4);
+WITH c AS MATERIALIZED (
+    SELECT aid
+    FROM pgbench_accounts
+    WHERE aid <= 10
+)
+SELECT count(*) FROM c;
+WITH RECURSIVE r(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM r WHERE n < 8
+)
+SELECT sum(n) FROM r;
+"""),
+        ("sort-unique-setop-window", r"""
+SELECT *
+FROM (
+    SELECT id, region
+    FROM aez_customer
+    ORDER BY region, id
+    LIMIT 40
+) s
+WHERE region >= 0;
+SELECT DISTINCT region
+FROM aez_customer
+ORDER BY region;
+SELECT region
+FROM aez_customer
+INTERSECT
+SELECT region
+FROM aez_customer
+WHERE active;
+SELECT id, row_number() OVER (PARTITION BY region ORDER BY id)
+FROM aez_customer
+LIMIT 40;
+"""),
+        ("join-variants", r"""
+\set cid random(1, :aez_customers - 1000)
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT count(*)
+FROM aez_order o
+JOIN aez_customer c ON c.id = o.customer_id
+WHERE o.customer_id BETWEEN :cid AND :cid + 999
+  AND c.active;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_mergejoin = on;
+SELECT count(*)
+FROM aez_order o
+JOIN aez_customer c ON c.id = o.customer_id
+WHERE o.customer_id BETWEEN :cid AND :cid + 999;
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = on;
+SET enable_memoize = on;
+SELECT count(*)
+FROM aez_order o
+JOIN aez_customer c ON c.id = o.customer_id
+WHERE o.customer_id BETWEEN :cid AND :cid + 999;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+RESET enable_memoize;
+"""),
+        ("partition-lock-modify", r"""
+\set aid random(1, :naccounts)
+\set mid random(1, 1000000)
+BEGIN;
+SELECT aid
+FROM pgbench_accounts
+WHERE aid = :aid
+FOR UPDATE;
+COMMIT;
+SELECT count(*)
+FROM aez_part
+WHERE id BETWEEN 1 AND 220;
+INSERT INTO aez_mod VALUES (:mid, 'a')
+ON CONFLICT (id) DO UPDATE SET payload = excluded.payload;
+UPDATE aez_mod SET payload = 'b' WHERE id = :mid;
+DELETE FROM aez_mod WHERE id = :mid;
+"""),
+        ("parallel", r"""
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SELECT bucket, count(*), sum(id)
+FROM aez_parallel
+GROUP BY bucket
+ORDER BY bucket;
+"""),
+        ("complex", r"""
+\set cid random(1, :aez_customers - 1000)
+WITH regional_totals AS (
+    SELECT c.region, o.customer_id, sum(o.amount) AS total_amount,
+           count(*) AS order_count
+    FROM aez_order o
+    JOIN aez_customer c ON c.id = o.customer_id
+    WHERE o.customer_id BETWEEN :cid AND :cid + 999
+      AND o.status IN ('paid', 'open')
+      AND c.active
+    GROUP BY c.region, o.customer_id
+)
+SELECT region, count(*), sum(total_amount), avg(order_count)
+FROM regional_totals
+WHERE total_amount > 1000
+GROUP BY region
+ORDER BY region;
+"""),
+        ("very-complex", r"""
+\set cid random(1, :aez_customers - 1500)
+WITH filtered_orders AS MATERIALIZED (
+    SELECT o.id, o.customer_id, c.region, o.status, o.amount, o.created_at
+    FROM aez_order o
+    JOIN aez_customer c ON c.id = o.customer_id
+    WHERE o.customer_id BETWEEN :cid AND :cid + 1499
+      AND o.status IN ('paid', 'open')
+      AND c.active
+),
+event_rollup AS (
+    SELECT e.order_id, count(*) AS event_count, sum(e.value) AS event_value
+    FROM aez_event e
+    JOIN filtered_orders fo ON fo.id = e.order_id
+    WHERE e.event_type <> 'ignore'
+    GROUP BY e.order_id
+),
+ranked AS (
+    SELECT fo.region, fo.status, fo.customer_id,
+           fo.amount + coalesce(er.event_value, 0) AS total_score,
+           coalesce(er.event_count, 0) AS event_count,
+           row_number() OVER (
+               PARTITION BY fo.region, fo.status
+               ORDER BY fo.amount DESC, fo.created_at DESC
+           ) AS rn
+    FROM filtered_orders fo
+    LEFT JOIN event_rollup er ON er.order_id = fo.id
+)
+SELECT region, status, count(*), sum(total_score), avg(event_count), max(rn)
+FROM ranked
+WHERE rn <= 20
+GROUP BY region, status
+ORDER BY region, status;
+"""),
+    ],
+}
+
+WORKLOAD_OPTIONS = {
+    **BUILTIN_WORKLOAD_OPTIONS,
+    **{name: [] for name in CUSTOM_WORKLOADS},
+}
+
+
+def split_csv(value):
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def run(cmd, env=None, cwd=None, check=True, capture=True):
+    kwargs = {
+        "env": env,
+        "cwd": cwd,
+        "text": True,
+    }
+    if capture:
+        kwargs.update({"stdout": subprocess.PIPE, "stderr": subprocess.PIPE})
+    proc = subprocess.run(cmd, **kwargs)
+    if check and proc.returncode != 0:
+        out = proc.stdout or ""
+        err = proc.stderr or ""
+        raise BenchError(
+            "command failed: {}\n{}\n{}".format(
+                " ".join(map(str, cmd)), out.strip(), err.strip()).strip()
+        )
+    return proc
+
+
+def find_bin(name, bindir=None, extra=()):
+    for candidate in extra:
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+    if bindir:
+        path = Path(bindir) / name
+        if path.exists():
+            return str(path)
+    path = shutil.which(name)
+    if path:
+        return path
+    raise BenchError(f"could not find required program: {name}")
+
+
+def get_bindir(pg_config):
+    proc = run([pg_config, "--bindir"])
+    return proc.stdout.strip()
+
+
+def get_sharedir(pg_config):
+    proc = run([pg_config, "--sharedir"], check=False)
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    return None
+
+
+def source_root(script):
+    path = Path(script).resolve()
+    if path.parent.name == "auto_explain_z" and path.parent.parent.name == "contrib":
+        return path.parent.parent.parent
+    return None
+
+
+def build_contrib(root):
+    if root is None:
+        raise BenchError("--build-contrib requires running from a PostgreSQL source tree")
+    run(["make", "-C", str(root / "contrib" / "auto_explain")], capture=False)
+    run(["make", "-C", str(root / "contrib" / "auto_explain_z")], capture=False)
+
+
+def source_tree_bindir(paths, work, root):
+    bindir = work / "bin"
+    libdir = work / "lib"
+    bindir.mkdir(parents=True, exist_ok=True)
+    libdir.mkdir(parents=True, exist_ok=True)
+    linked = {}
+    for name in ("postgres", "initdb", "psql", "pgbench"):
+        src = Path(paths[name])
+        dst = bindir / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        shutil.copy2(src, dst)
+        linked[name] = str(dst)
+    for ext in (".so", ".dylib"):
+        for src in (
+            root / "src" / "backend" / "snowball" / f"dict_snowball{ext}",
+            root / "src" / "pl" / "plpgsql" / "src" / f"plpgsql{ext}",
+        ):
+            if src.exists():
+                shutil.copy2(src, libdir / src.name)
+    return linked
+
+
+def source_tree_sharedir(root, work, installed_sharedir=None):
+    sharedir = work / "share"
+    sharedir.mkdir(parents=True, exist_ok=True)
+    files = {
+        root / "src" / "include" / "catalog" / "postgres.bki": "postgres.bki",
+        root / "src" / "backend" / "libpq" / "pg_hba.conf.sample": "pg_hba.conf.sample",
+        root / "src" / "backend" / "libpq" / "pg_ident.conf.sample": "pg_ident.conf.sample",
+        root / "src" / "backend" / "utils" / "misc" / "postgresql.conf.sample": "postgresql.conf.sample",
+        root / "src" / "backend" / "snowball" / "snowball_create.sql": "snowball_create.sql",
+        root / "src" / "backend" / "catalog" / "information_schema.sql": "information_schema.sql",
+        root / "src" / "backend" / "catalog" / "sql_features.txt": "sql_features.txt",
+        root / "src" / "include" / "catalog" / "system_constraints.sql": "system_constraints.sql",
+        root / "src" / "backend" / "catalog" / "system_functions.sql": "system_functions.sql",
+        root / "src" / "backend" / "catalog" / "system_views.sql": "system_views.sql",
+    }
+    for src, dstname in files.items():
+        if not src.exists():
+            raise BenchError(f"missing source-tree initdb input: {src}")
+        shutil.copy2(src, sharedir / dstname)
+
+    extdir = sharedir / "extension"
+    extdir.mkdir(parents=True, exist_ok=True)
+    for name in ("plpgsql.control", "plpgsql--1.0.sql"):
+        src = root / "src" / "pl" / "plpgsql" / "src" / name
+        if src.exists():
+            shutil.copy2(src, extdir / name)
+
+    tznames = root / "src" / "timezone" / "tznames"
+    if tznames.exists():
+        shutil.copytree(tznames, sharedir / "timezonesets")
+
+    installed_tzdir = Path(installed_sharedir) / "timezone" if installed_sharedir else None
+    if installed_tzdir and installed_tzdir.exists():
+        shutil.copytree(installed_tzdir, sharedir / "timezone")
+
+    return str(sharedir)
+
+
+def write_custom_workload_scripts(work):
+    scripts = {}
+    scriptdir = work / "workload_scripts"
+    scriptdir.mkdir(parents=True, exist_ok=True)
+    for name, body in CUSTOM_WORKLOADS.items():
+        if isinstance(body, list):
+            paths = []
+            for suffix, script_body in body:
+                path = scriptdir / f"{name}-{suffix}.sql"
+                path.write_text(script_body.lstrip(), encoding="utf-8")
+                paths.append(path)
+            scripts[name] = paths
+        else:
+            path = scriptdir / f"{name}.sql"
+            path.write_text(body.lstrip(), encoding="utf-8")
+            scripts[name] = path
+    return scripts
+
+
+def pick_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def dir_size(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += child.stat().st_size
+    return total
+
+
+def file_size(path):
+    path = Path(path)
+    return path.stat().st_size if path.exists() else 0
+
+
+def parse_ps_time(value):
+    value = value.strip()
+    days = 0
+    if "-" in value:
+        daystr, value = value.split("-", 1)
+        days = int(daystr)
+    parts = value.split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    else:
+        return float(value)
+    return days * 86400 + int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def process_cpu_snapshot(root_pid):
+    proc = run(["ps", "-axo", "pid=,ppid=,time="])
+    children = {}
+    times = {}
+    for line in proc.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3:
+            continue
+        pid = int(fields[0])
+        ppid = int(fields[1])
+        children.setdefault(ppid, []).append(pid)
+        times[pid] = parse_ps_time(fields[2])
+
+    total = 0.0
+    stack = [root_pid]
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += times.get(pid, 0.0)
+        stack.extend(children.get(pid, []))
+    return total
+
+
+def child_cpu_snapshot():
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
+def parse_pgbench(output):
+    result = {"raw": output}
+    m = re.search(r"number of transactions actually processed:\s+([0-9]+)", output)
+    if m:
+        result["transactions"] = int(m.group(1))
+    m = re.search(r"latency average =\s+([0-9.]+)\s+ms", output)
+    if m:
+        result["latency_ms"] = float(m.group(1))
+    matches = re.findall(r"tps =\s+([0-9.]+)\s+\(([^)]*)\)", output)
+    if matches:
+        for value, label in matches:
+            if "without initial connection time" in label:
+                result["tps"] = float(value)
+                break
+        else:
+            result["tps"] = float(matches[-1][0])
+    return result
+
+
+class Cluster:
+    def __init__(self, args, paths, root):
+        self.args = args
+        self.paths = paths
+        self.root = root
+        self.pgdata = paths["work"] / "data"
+        self.sockdir = paths["sock"]
+        self.port = args.port or pick_port()
+        self.proc = None
+        self.stderr_file = None
+
+    def env(self, appname=None):
+        env = os.environ.copy()
+        env.update({
+            "PGHOST": str(self.sockdir),
+            "PGPORT": str(self.port),
+            "PGDATABASE": self.args.database,
+        })
+        if self.args.user:
+            env["PGUSER"] = self.args.user
+        if appname:
+            env["PGAPPNAME"] = appname
+        return env
+
+    def dynamic_library_path(self):
+        dirs = []
+        if self.root is not None:
+            dirs.append(str(self.root / "contrib" / "auto_explain"))
+            dirs.append(str(self.root / "contrib" / "auto_explain_z"))
+        if self.args.dynamic_library_path:
+            dirs.append(self.args.dynamic_library_path)
+        return os.pathsep.join(dirs)
+
+    def initdb(self):
+        self.pgdata.parent.mkdir(parents=True, exist_ok=True)
+        self.sockdir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.paths["initdb"],
+            "-D", str(self.pgdata),
+            "-A", "trust",
+            "-N",
+        ]
+        if self.args.share_dir:
+            cmd.extend(["-L", self.args.share_dir])
+        elif self.paths.get("share"):
+            cmd.extend(["-L", self.paths["share"]])
+        run(cmd, capture=not self.args.verbose)
+
+    def common_gucs(self):
+        gucs = {
+            "listen_addresses": "",
+            "unix_socket_directories": str(self.sockdir),
+            "log_destination": "stderr",
+            "logging_collector": "off",
+            "log_min_messages": "warning",
+            "client_min_messages": "warning",
+            "compute_query_id": "on",
+        }
+        dynpath = self.dynamic_library_path()
+        if dynpath:
+            gucs["dynamic_library_path"] = dynpath
+        for item in self.args.extra_server_option:
+            key, sep, value = item.partition("=")
+            if not sep:
+                raise BenchError(f"server option must be key=value: {item}")
+            gucs[key] = value
+        return gucs
+
+    def start(self, scenario, gucs):
+        if self.proc is not None:
+            raise BenchError("server already running")
+        scenario.mkdir(parents=True, exist_ok=True)
+        stderr_path = scenario / "server.stderr"
+        self.stderr_file = open(stderr_path, "ab", buffering=0)
+        merged = self.common_gucs()
+        merged.update(gucs)
+        cmd = [
+            self.paths["postgres"],
+            "-D", str(self.pgdata),
+            "-p", str(self.port),
+        ]
+        for key, value in merged.items():
+            cmd.extend(["-c", f"{key}={value}"])
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=self.stderr_file,
+            stderr=self.stderr_file,
+            env=self.env(),
+            text=False,
+        )
+        deadline = time.time() + self.args.start_timeout
+        last_error = ""
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise BenchError(
+                    f"postgres exited during startup; see {stderr_path}"
+                )
+            proc = run([
+                self.paths["psql"],
+                "-XAtq",
+                "-d", self.args.database,
+                "-c", "select 1",
+            ], env=self.env(), check=False)
+            if proc.returncode == 0 and proc.stdout.strip() == "1":
+                return stderr_path
+            last_error = (proc.stderr or proc.stdout or "").strip()
+            time.sleep(0.1)
+        raise BenchError(f"server did not become ready: {last_error}")
+
+    def stop(self):
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=20)
+        if self.stderr_file:
+            self.stderr_file.close()
+        self.stderr_file = None
+        self.proc = None
+
+    def pgbench_command(self, seconds, workload):
+        if workload not in WORKLOAD_OPTIONS:
+            raise BenchError(f"unknown workload: {workload}")
+
+        naccounts = self.args.scale * 100000
+        aez_customers = max(2000, self.args.scale * 1000)
+        aez_orders = max(20000, self.args.scale * 10000)
+        aez_events = max(40000, self.args.scale * 20000)
+        aez_parallel = max(100000, self.args.scale * 50000)
+        cmd = [
+            self.paths["pgbench"],
+            "-n",
+            "-M", self.args.protocol,
+            "-c", str(self.args.clients),
+            "-j", str(self.args.jobs),
+            "-T", str(seconds),
+            "-D", f"naccounts={naccounts}",
+            "-D", f"aez_customers={aez_customers}",
+            "-D", f"aez_orders={aez_orders}",
+            "-D", f"aez_events={aez_events}",
+            "-D", f"aez_parallel={aez_parallel}",
+        ]
+        if workload in BUILTIN_WORKLOAD_OPTIONS:
+            cmd.extend(BUILTIN_WORKLOAD_OPTIONS[workload])
+        else:
+            scripts = self.paths["workload_scripts"][workload]
+            if isinstance(scripts, list):
+                for script in scripts:
+                    cmd.extend(["-f", str(script)])
+            else:
+                cmd.extend(["-f", str(scripts)])
+        cmd.append(self.args.database)
+        return cmd
+
+    def pgbench(self, seconds, appname, workload):
+        return run(self.pgbench_command(seconds, workload),
+                   env=self.env(appname), capture=True).stdout
+
+    def pgbench_measured(self, seconds, appname, workload,
+                         cpu_root_pid, cpu_start):
+        proc = subprocess.Popen(
+            self.pgbench_command(seconds, workload),
+            env=self.env(appname),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        max_cpu = cpu_start
+        while proc.poll() is None:
+            max_cpu = max(max_cpu, process_cpu_snapshot(cpu_root_pid))
+            time.sleep(self.args.cpu_sample_interval)
+        stdout, stderr = proc.communicate()
+        max_cpu = max(max_cpu, process_cpu_snapshot(cpu_root_pid))
+        if proc.returncode != 0:
+            raise BenchError(
+                "command failed: {}\n{}\n{}".format(
+                    " ".join(map(str, self.pgbench_command(seconds, workload))),
+                    stdout.strip(),
+                    stderr.strip()).strip()
+            )
+        return stdout, max_cpu
+
+    def prepare_pgbench(self):
+        scenario = self.paths["work"] / "prepare"
+        self.start(scenario, {})
+        try:
+            run([
+                self.paths["pgbench"],
+                "-i",
+                "-s", str(self.args.scale),
+                self.args.database,
+            ], env=self.env("auto_explain_z_bench_init"),
+               capture=not self.args.verbose)
+            run([
+                self.paths["psql"],
+                "-XAtq",
+                "-d", self.args.database,
+                "-c", "vacuum analyze",
+            ], env=self.env("auto_explain_z_bench_init"),
+               capture=not self.args.verbose)
+            if any(w in CUSTOM_WORKLOADS for w in split_csv(self.args.workloads)):
+                self.prepare_shape_schema()
+        finally:
+            self.stop()
+
+    def prepare_shape_schema(self):
+        customers = max(2000, self.args.scale * 1000)
+        orders = max(20000, self.args.scale * 10000)
+        events = max(40000, self.args.scale * 20000)
+        parallel_rows = max(100000, self.args.scale * 50000)
+        sql = f"""
+SET synchronous_commit = off;
+DROP TABLE IF EXISTS aez_mod;
+DROP TABLE IF EXISTS aez_parallel;
+DROP TABLE IF EXISTS aez_part CASCADE;
+DROP TABLE IF EXISTS aez_bitmap;
+DROP TABLE IF EXISTS aez_event;
+DROP TABLE IF EXISTS aez_order;
+DROP TABLE IF EXISTS aez_customer;
+CREATE TABLE aez_customer (
+    id int PRIMARY KEY,
+    region int NOT NULL,
+    active boolean NOT NULL,
+    segment int NOT NULL
+);
+CREATE TABLE aez_order (
+    id int PRIMARY KEY,
+    customer_id int NOT NULL REFERENCES aez_customer(id),
+    branch_id int NOT NULL,
+    teller_id int NOT NULL,
+    amount int NOT NULL,
+    status text NOT NULL,
+    created_at date NOT NULL
+);
+CREATE TABLE aez_event (
+    id bigint PRIMARY KEY,
+    order_id int NOT NULL REFERENCES aez_order(id),
+    event_type text NOT NULL,
+    value int NOT NULL,
+    created_at timestamp NOT NULL
+);
+CREATE TABLE aez_bitmap (
+    id int PRIMARY KEY,
+    a int NOT NULL,
+    b int NOT NULL,
+    filler text
+);
+CREATE TABLE aez_part (
+    id int,
+    region int,
+    payload text
+) PARTITION BY RANGE (id);
+CREATE TABLE aez_part_1 PARTITION OF aez_part FOR VALUES FROM (0) TO (100);
+CREATE TABLE aez_part_2 PARTITION OF aez_part FOR VALUES FROM (100) TO (200);
+CREATE TABLE aez_part_3 PARTITION OF aez_part FOR VALUES FROM (200) TO (300);
+CREATE TABLE aez_parallel (
+    id int,
+    bucket int,
+    filler text
+);
+CREATE TABLE aez_mod (
+    id int PRIMARY KEY,
+    payload text
+);
+INSERT INTO aez_customer
+SELECT g,
+       g % 20,
+       g % 7 <> 0,
+       g % 5
+FROM generate_series(1, {customers}) AS g;
+INSERT INTO aez_order
+SELECT g,
+       (g % {customers}) + 1,
+       (g % greatest(1, {self.args.scale} * 10)) + 1,
+       (g % greatest(1, {self.args.scale} * 100)) + 1,
+       (g % 500) + 1,
+       CASE WHEN g % 5 IN (0, 1) THEN 'paid'
+            WHEN g % 5 IN (2, 3) THEN 'open'
+            ELSE 'void' END,
+       DATE '2024-01-01' + (g % 365)
+FROM generate_series(1, {orders}) AS g;
+INSERT INTO aez_event
+SELECT g,
+       (g % {orders}) + 1,
+       CASE WHEN g % 6 = 0 THEN 'ignore'
+            WHEN g % 3 = 0 THEN 'ship'
+            WHEN g % 3 = 1 THEN 'pay'
+            ELSE 'note' END,
+       (g % 100) + 1,
+       TIMESTAMP '2024-01-01' + ((g % 100000) * INTERVAL '1 second')
+FROM generate_series(1, {events}) AS g;
+INSERT INTO aez_bitmap
+SELECT g,
+       g % 1000,
+       (g * 7) % 1000,
+       repeat('b', 16)
+FROM generate_series(1, 20000) AS g;
+INSERT INTO aez_part
+SELECT g, g % 7, repeat('r', 12)
+FROM generate_series(1, 240) AS g;
+INSERT INTO aez_parallel
+SELECT g, g % 64, repeat('q', 20)
+FROM generate_series(1, {parallel_rows}) AS g;
+CREATE INDEX aez_order_customer_idx ON aez_order(customer_id);
+CREATE INDEX aez_order_status_customer_idx ON aez_order(status, customer_id);
+CREATE INDEX aez_order_created_idx ON aez_order(created_at);
+CREATE INDEX aez_event_order_idx ON aez_event(order_id);
+CREATE INDEX aez_event_type_order_idx ON aez_event(event_type, order_id);
+CREATE INDEX aez_bitmap_a_idx ON aez_bitmap(a);
+CREATE INDEX aez_bitmap_b_idx ON aez_bitmap(b);
+CREATE INDEX aez_part_id_idx ON aez_part(id);
+ALTER TABLE aez_parallel SET (parallel_workers = 4);
+ANALYZE aez_customer;
+ANALYZE aez_order;
+ANALYZE aez_event;
+ANALYZE aez_bitmap;
+ANALYZE aez_part;
+ANALYZE aez_parallel;
+ANALYZE aez_mod;
+"""
+        run([
+            self.paths["psql"],
+            "-XAtq",
+            "-d", self.args.database,
+            "-v", "ON_ERROR_STOP=1",
+            "-c", sql,
+        ], env=self.env("auto_explain_z_bench_shape_init"),
+           capture=not self.args.verbose)
+
+
+def parse_template_mode(value):
+    normalized = value.strip().lower()
+    if normalized in ("on", "true", "1", "yes", "template", "templated", "tpl"):
+        return True
+    if normalized in ("off", "false", "0", "no", "notpl", "no-template",
+                      "non-templated", "untemplated"):
+        return False
+    raise BenchError(f"unknown template mode: {value}")
+
+
+def aez_scenario_config(args, scenario):
+    if not scenario.startswith("auto_explain_z_"):
+        return None
+
+    tail = scenario.removeprefix("auto_explain_z_")
+    parts = tail.split("_")
+    if len(parts) == 1:
+        return {
+            "profile": parts[0],
+            "compression": args.compression,
+            "template_cache": args.template_cache,
+        }
+    if len(parts) == 3:
+        return {
+            "profile": parts[0],
+            "compression": parts[1],
+            "template_cache": parse_template_mode(parts[2]),
+        }
+    raise BenchError(f"invalid auto_explain_z scenario name: {scenario}")
+
+
+def scenario_metadata(args, scenario):
+    if scenario == "baseline":
+        return {"kind": "baseline"}
+    if scenario == "auto_explain":
+        return {
+            "kind": "auto_explain",
+            "format": args.auto_explain_format,
+        }
+    if scenario.startswith("auto_explain_") and not scenario.startswith("auto_explain_z_"):
+        return {
+            "kind": "auto_explain",
+            "format": scenario.removeprefix("auto_explain_"),
+        }
+    config = aez_scenario_config(args, scenario)
+    if config is None:
+        raise BenchError(f"unknown scenario: {scenario}")
+    return {
+        "kind": "auto_explain_z",
+        **config,
+    }
+
+
+def scenario_gucs(args, scenario, aez_dir):
+    analyze = "on" if args.analyze else "off"
+    timing = "on" if args.timing else "off"
+    buffers = "on" if args.buffers and args.analyze else "off"
+    wal = "on" if args.wal and args.analyze else "off"
+
+    if scenario == "baseline":
+        return {}
+
+    if scenario == "auto_explain" or (
+        scenario.startswith("auto_explain_") and
+        not scenario.startswith("auto_explain_z_")
+    ):
+        log_format = (args.auto_explain_format if scenario == "auto_explain"
+                      else scenario.removeprefix("auto_explain_"))
+        return {
+            "session_preload_libraries": "auto_explain",
+            "auto_explain.log_min_duration": "0",
+            "auto_explain.sample_rate": str(args.sample_rate),
+            "auto_explain.log_analyze": analyze,
+            "auto_explain.log_timing": timing,
+            "auto_explain.log_buffers": buffers,
+            "auto_explain.log_wal": wal,
+            "auto_explain.log_nested_statements": "off",
+            "auto_explain.log_verbose": "on" if args.verbose_plans else "off",
+            "auto_explain.log_format": log_format,
+        }
+
+    config = aez_scenario_config(args, scenario)
+    if config is None:
+        raise BenchError(f"unknown scenario: {scenario}")
+    profile = config["profile"]
+    gucs = {
+        "session_preload_libraries": "auto_explain_z",
+        "auto_explain_z.log_min_duration": "0",
+        "auto_explain_z.sample_rate": str(args.sample_rate),
+        "auto_explain_z.log_analyze": analyze,
+        "auto_explain_z.log_timing": timing,
+        "auto_explain_z.log_buffers": buffers,
+        "auto_explain_z.log_wal": wal,
+        "auto_explain_z.log_nested_statements": "off",
+        "auto_explain_z.log_verbose": "on" if args.verbose_plans else "off",
+        "auto_explain_z.log_query_text": "on" if args.query_text else "off",
+        "auto_explain_z.profile": profile,
+        "auto_explain_z.directory": str(aez_dir),
+        "auto_explain_z.template_cache": "on" if config["template_cache"] else "off",
+        "auto_explain_z.max_templates": str(args.max_templates),
+        "auto_explain_z.template_min_plan_bytes": str(args.template_min_plan_bytes),
+    }
+    if config["compression"] != "default":
+        gucs["auto_explain_z.compression"] = config["compression"]
+    return gucs
+
+
+def run_scenario(cluster, args, name, workload, iteration):
+    scenario_dir = cluster.paths["work"] / workload / name / str(iteration)
+    aez_dir = scenario_dir / "aez"
+    aez_dir.mkdir(parents=True, exist_ok=True)
+    gucs = scenario_gucs(args, name, aez_dir)
+    stderr_path = cluster.start(scenario_dir, gucs)
+    try:
+        if args.warmup > 0:
+            cluster.pgbench(args.warmup, f"{name}_{workload}_warmup",
+                            workload)
+
+        log_start = file_size(stderr_path)
+        aez_start = dir_size(aez_dir)
+        server_cpu_start = process_cpu_snapshot(cluster.proc.pid)
+        child_cpu_start = child_cpu_snapshot()
+        wall_start = time.monotonic()
+
+        output, server_cpu_end = cluster.pgbench_measured(args.duration, name,
+                                                          workload,
+                                                          cluster.proc.pid,
+                                                          server_cpu_start)
+
+        wall = time.monotonic() - wall_start
+        child_cpu = child_cpu_snapshot() - child_cpu_start
+        server_cpu = server_cpu_end - server_cpu_start
+        log_bytes = file_size(stderr_path) - log_start
+        aez_bytes = dir_size(aez_dir) - aez_start
+        parsed = parse_pgbench(output)
+
+        tx = parsed.get("transactions", 0)
+        total_log_bytes = log_bytes + aez_bytes
+        result = {
+            "scenario": name,
+            "workload": workload,
+            "iteration": iteration,
+            "scenario_config": scenario_metadata(args, name),
+            "pgbench": parsed,
+            "wall_seconds": wall,
+            "server_cpu_seconds": server_cpu,
+            "pgbench_cpu_seconds": child_cpu,
+            "regular_log_bytes": log_bytes,
+            "auto_explain_z_bytes": aez_bytes,
+            "total_plan_log_bytes": total_log_bytes,
+            "bytes_per_transaction": (total_log_bytes / tx) if tx else None,
+            "stderr_path": str(stderr_path),
+            "auto_explain_z_dir": str(aez_dir),
+        }
+        return result
+    finally:
+        cluster.stop()
+
+
+def summarize_results(results):
+    groups = {}
+    for result in results:
+        key = (result["workload"], result["scenario"])
+        groups.setdefault(key, []).append(result)
+
+    baseline_tps = {}
+    for (workload, scenario), items in groups.items():
+        if scenario != "baseline":
+            continue
+        values = [
+            r["pgbench"].get("tps") for r in items
+            if r["pgbench"].get("tps") is not None
+        ]
+        if values:
+            baseline_tps[workload] = statistics.mean(values)
+
+    summary = []
+    for key in sorted(groups):
+        workload, scenario = key
+        items = groups[key]
+        tps_values = [
+            r["pgbench"].get("tps") for r in items
+            if r["pgbench"].get("tps") is not None
+        ]
+        lat_values = [r["pgbench"].get("latency_ms", 0) for r in items]
+        cpu_values = [
+            100.0 * r["server_cpu_seconds"] / r["wall_seconds"]
+            for r in items if r["wall_seconds"] > 0
+        ]
+        bytes_values = [r["total_plan_log_bytes"] for r in items]
+        bytes_tx_values = [
+            r["bytes_per_transaction"] for r in items
+            if r["bytes_per_transaction"] is not None
+        ]
+        tps_mean = statistics.mean(tps_values) if tps_values else None
+        base = baseline_tps.get(workload)
+        summary.append({
+            "workload": workload,
+            "scenario": scenario,
+            "runs": len(items),
+            "tps_mean": tps_mean,
+            "tps_stdev": statistics.stdev(tps_values)
+            if len(tps_values) > 1 else 0.0,
+            "latency_ms_mean": statistics.mean(lat_values) if lat_values else None,
+            "server_cpu_pct_mean": statistics.mean(cpu_values) if cpu_values else None,
+            "log_bytes_mean": statistics.mean(bytes_values) if bytes_values else None,
+            "bytes_per_transaction_mean": statistics.mean(bytes_tx_values)
+            if bytes_tx_values else None,
+            "tps_overhead_pct": 100.0 * (base - tps_mean) / base
+            if base and tps_mean else None,
+        })
+    return summary
+
+
+def print_table(results):
+    summary = summarize_results(results)
+    headers = [
+        "workload", "scenario", "runs", "tps_mean", "tps_sd",
+        "lat_ms", "cpu_pct", "log_bytes", "bytes_tx", "tps_overhead",
+    ]
+    rows = []
+    for result in summary:
+        rows.append([
+            result["workload"],
+            result["scenario"],
+            str(result["runs"]),
+            f"{result['tps_mean']:.1f}" if result["tps_mean"] is not None else "",
+            f"{result['tps_stdev']:.1f}",
+            f"{result['latency_ms_mean']:.3f}" if result["latency_ms_mean"] is not None else "",
+            f"{result['server_cpu_pct_mean']:.1f}" if result["server_cpu_pct_mean"] is not None else "",
+            f"{result['log_bytes_mean']:.0f}" if result["log_bytes_mean"] is not None else "",
+            f"{result['bytes_per_transaction_mean']:.1f}" if result["bytes_per_transaction_mean"] is not None else "",
+            f"{result['tps_overhead_pct']:.2f}%" if result["tps_overhead_pct"] is not None else "",
+        ])
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows))
+        for i in range(len(headers))
+    ]
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Benchmark auto_explain versus auto_explain_z using pgbench")
+    parser.add_argument("--pg-config", default=shutil.which("pg_config") or "pg_config")
+    parser.add_argument("--build-contrib", action="store_true",
+                        help="run make in contrib/auto_explain and this auto_explain_z checkout first")
+    parser.add_argument("--workdir",
+                        help="directory for the temporary cluster and logs")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the generated workdir")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--database", default="postgres")
+    parser.add_argument("--user")
+    parser.add_argument("--scale", type=int, default=10)
+    parser.add_argument("--clients", type=int, default=8)
+    parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--duration", type=int, default=30)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=1,
+                        help="number of measured runs per workload/scenario")
+    parser.add_argument("--workloads", default="select-only",
+                        help="comma-separated workloads: {}".format(
+                            ", ".join(sorted(WORKLOAD_OPTIONS))))
+    parser.add_argument("--protocol", choices=("simple", "extended", "prepared"),
+                        default="prepared")
+    parser.add_argument("--aez-profiles", default="simple",
+                        help="comma-separated auto_explain_z profiles to run")
+    parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument("--skip-auto-explain", action="store_true")
+    parser.add_argument("--auto-explain-format", choices=("text", "json", "yaml", "xml"),
+                        default="text")
+    parser.add_argument("--auto-explain-formats",
+                        help="comma-separated regular auto_explain format matrix: text,json,yaml,xml")
+    parser.add_argument("--compression", choices=("default", "none", "lz4", "zstd"),
+                        default="default")
+    parser.add_argument("--compressions",
+                        help="comma-separated auto_explain_z compression matrix, e.g. none,lz4,zstd")
+    parser.add_argument("--sample-rate", type=float, default=1.0)
+    parser.add_argument("--analyze", action="store_true")
+    parser.add_argument("--timing", action="store_true", default=True)
+    parser.add_argument("--no-timing", dest="timing", action="store_false")
+    parser.add_argument("--buffers", action="store_true")
+    parser.add_argument("--wal", action="store_true")
+    parser.add_argument("--verbose-plans", action="store_true")
+    parser.add_argument("--query-text", action="store_true", default=True)
+    parser.add_argument("--no-query-text", dest="query_text", action="store_false")
+    parser.add_argument("--template-cache", action="store_true", default=True)
+    parser.add_argument("--no-template-cache", dest="template_cache", action="store_false")
+    parser.add_argument("--template-modes",
+                        help="comma-separated auto_explain_z template-cache matrix: on,off")
+    parser.add_argument("--max-templates", type=int, default=4096)
+    parser.add_argument("--template-min-plan-bytes", type=int, default=0)
+    parser.add_argument("--dynamic-library-path")
+    parser.add_argument("--share-dir",
+                        help="initdb input/share directory; useful for uninstalled source-tree runs")
+    parser.add_argument("--extra-server-option", action="append", default=[],
+                        help="additional postgres -c key=value option")
+    parser.add_argument("--start-timeout", type=int, default=30)
+    parser.add_argument("--cpu-sample-interval", type=float, default=0.1)
+    parser.add_argument("--json-output",
+                        help="write raw benchmark results as JSON")
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv):
+    args = parse_args(argv)
+    root = source_root(sys.argv[0])
+    if args.build_contrib:
+        build_contrib(root)
+
+    bindir = get_bindir(args.pg_config)
+    sharedir = get_sharedir(args.pg_config)
+    source_bins = {}
+    if root is not None:
+        source_bins = {
+            "postgres": [root / "src" / "backend" / "postgres"],
+            "initdb": [root / "src" / "bin" / "initdb" / "initdb"],
+            "psql": [root / "src" / "bin" / "psql" / "psql"],
+            "pgbench": [root / "src" / "bin" / "pgbench" / "pgbench"],
+        }
+    paths = {
+        "postgres": find_bin("postgres", bindir, source_bins.get("postgres", [])),
+        "initdb": find_bin("initdb", bindir, source_bins.get("initdb", [])),
+        "psql": find_bin("psql", bindir, source_bins.get("psql", [])),
+        "pgbench": find_bin("pgbench", bindir, source_bins.get("pgbench", [])),
+    }
+
+    cleanup = False
+    if args.workdir:
+        work = Path(args.workdir).resolve()
+        work.mkdir(parents=True, exist_ok=True)
+    else:
+        work = Path(tempfile.mkdtemp(prefix="auto_explain_z_bench.")).resolve()
+        cleanup = not args.keep
+    paths["work"] = work
+    paths["sock"] = Path(tempfile.mkdtemp(prefix="aezsock.", dir="/tmp")).resolve()
+    if root is not None and str(paths["initdb"]).startswith(str(root)):
+        paths.update(source_tree_bindir(paths, work, root))
+        paths["share"] = source_tree_sharedir(root, work, sharedir)
+    paths["workload_scripts"] = write_custom_workload_scripts(work)
+
+    cluster = Cluster(args, paths, root)
+    results = []
+    try:
+        cluster.initdb()
+        cluster.prepare_pgbench()
+
+        scenarios = []
+        if not args.skip_baseline:
+            scenarios.append("baseline")
+        if not args.skip_auto_explain:
+            if args.auto_explain_formats is None:
+                scenarios.append("auto_explain")
+            else:
+                for fmt in split_csv(args.auto_explain_formats):
+                    if fmt not in ("text", "json", "yaml", "xml"):
+                        raise BenchError(f"unknown auto_explain format: {fmt}")
+                    scenarios.append(f"auto_explain_{fmt}")
+        matrix_mode = args.compressions is not None or args.template_modes is not None
+        compressions = (split_csv(args.compressions)
+                        if args.compressions is not None else [args.compression])
+        for compression in compressions:
+            if compression not in ("default", "none", "lz4", "zstd"):
+                raise BenchError(f"unknown compression: {compression}")
+        template_modes = (split_csv(args.template_modes)
+                          if args.template_modes is not None
+                          else ["on" if args.template_cache else "off"])
+        template_modes = ["tpl" if parse_template_mode(mode) else "notpl"
+                          for mode in template_modes]
+
+        for profile in split_csv(args.aez_profiles):
+            if profile not in ("simple", "full"):
+                raise BenchError(f"unknown auto_explain_z profile: {profile}")
+            if matrix_mode:
+                for compression in compressions:
+                    for template_mode in template_modes:
+                        scenarios.append(
+                            f"auto_explain_z_{profile}_{compression}_{template_mode}")
+            else:
+                scenarios.append(f"auto_explain_z_{profile}")
+
+        workloads = split_csv(args.workloads)
+        for workload in workloads:
+            if workload not in WORKLOAD_OPTIONS:
+                raise BenchError(f"unknown workload: {workload}")
+
+        for workload in workloads:
+            for iteration in range(1, args.iterations + 1):
+                for scenario in scenarios:
+                    print(f"running {workload} {scenario} iteration {iteration}...",
+                          flush=True)
+                    results.append(run_scenario(cluster, args, scenario,
+                                                workload, iteration))
+
+        print_table(results)
+        if args.json_output:
+            Path(args.json_output).write_text(
+                json.dumps({
+                    "runs": results,
+                    "summary": summarize_results(results),
+                }, indent=2),
+                encoding="utf-8")
+        if cleanup:
+            print(f"workdir removed: {work}")
+        else:
+            print(f"workdir: {work}")
+    finally:
+        cluster.stop()
+        shutil.rmtree(paths["sock"], ignore_errors=True)
+        if cleanup:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except BenchError as e:
+        print(f"auto_explain_z_bench: {e}", file=sys.stderr)
+        sys.exit(1)
