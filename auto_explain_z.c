@@ -53,6 +53,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -77,7 +78,7 @@ PG_FUNCTION_INFO_V1(auto_explain_z_rotate_logfile);
 Datum		auto_explain_z_rotate_logfile(PG_FUNCTION_ARGS);
 
 #define AEZ_FILE_MAGIC			((uint32) 0x315a4541)	/* "AEZ1" */
-#define AEZ_FORMAT_VERSION		12
+#define AEZ_FORMAT_VERSION		13
 #define AEZ_FILE_HEADER_LEN		40
 #define AEZ_BYTES_TO_KILOBYTES(b) (((b) + 1023) / 1024)
 #define AEZ_DEFAULT_PENDING_BUFFER_SIZE_KB 1024
@@ -291,15 +292,30 @@ typedef struct AezQueryTemplateEntry
 typedef struct AezSharedTemplateEntry
 {
 	AezTemplateKey key;
+	uint32		template_id;
 	uint32		plan_bytes;
 } AezSharedTemplateEntry;
 
 typedef struct AezSharedState
 {
-	LWLock	   *lock;
+	LWLock	   *template_lock;
+	LWLock	   *log_lock;
 	uint32		max_templates;
 	uint32		template_count;
+	uint32		next_template_id;
 	uint64		rotation_generation;
+	uint64		handled_rotation_generation;
+	uint64		log_generation;
+	uint64		file_index;
+	uint64		file_bytes;
+	uint64		file_uncompressed_bytes;
+	TimestampTz file_opened_ts;
+	int			file_compression;
+	bool		file_active;
+	char		directory[MAXPGPATH];
+	char		file_prefix[MAXPGPATH];
+	char		log_filename[MAXPGPATH];
+	char		path[MAXPGPATH];
 } AezSharedState;
 
 typedef struct AezPlanningEntry
@@ -397,6 +413,7 @@ static HTAB *aez_shared_template_hash = NULL;
 /* Per-backend writer state. */
 static int	aez_fd = -1;
 static uint64 aez_file_index = 0;
+static uint64 aez_file_generation = 0;
 static uint64 aez_file_bytes = 0;
 static uint64 aez_file_uncompressed_bytes = 0;
 static int	aez_file_compression = AEZ_COMPRESSION_NONE;
@@ -459,6 +476,7 @@ static void aez_shmem_startup(void);
 static Size aez_memsize(void);
 static void aez_ensure_proc_exit_registered(void);
 static void aez_proc_exit(int code, Datum arg);
+static bool aez_use_shared_log(void);
 static bool aez_request_log_rotation(void);
 static bool aez_rotation_requested(void);
 static void aez_ack_rotation_request(void);
@@ -466,19 +484,35 @@ static bool aez_file_age_exceeded(TimestampTz now);
 static bool aez_write_record(StringInfo record);
 static bool aez_file_preflight_needed(void);
 static bool aez_open_file(uint64 needed);
+static bool aez_open_file_locked(uint64 needed, TimestampTz now,
+								 bool *created_new_file);
+static void aez_rotate_shared_file_locked(TimestampTz now, bool reset_index);
+static void aez_reset_shared_templates_locked(void);
+static bool aez_shared_settings_changed_locked(void);
+static bool aez_create_shared_file_locked(TimestampTz now,
+										  bool truncate_on_open);
+static bool aez_open_shared_file_for_backend(void);
+static void aez_remember_current_file(const char *path, const char *directory,
+									  const char *prefix);
 static void aez_close_file(void);
-static char *aez_build_log_filename(void);
+static void aez_close_file_descriptor(void);
+static char *aez_build_log_filename(uint64 file_index);
 static int	aez_select_compression(void);
 static bool aez_start_compression(void);
 static bool aez_finish_compression(void);
 static void aez_init_pending_buffer(void);
 static bool aez_flush_pending(void);
 static bool aez_write_file_data(const char *data, size_t len);
+static bool aez_write_shared_file_data(const char *data, size_t len);
+static char *aez_compress_shared_chunk(const char *data, size_t len,
+									   int compression, size_t *out_len);
 static void aez_cleanup_logs(bool force);
 static int	aez_log_file_cmp(const void *a, const void *b);
 static bool aez_log_filename_matches(const char *name);
 static bool aez_has_suffix(const char *name, const char *suffix);
 static bool aez_write_all(int fd, const char *data, size_t len);
+static bool aez_write_all_at(int fd, const char *data, size_t len,
+							 uint64 offset);
 static void aez_writer_warning(const char *message);
 static void aez_reset_top_stringinfo(StringInfoData *buf, bool *initialized);
 static void aez_build_file_header(StringInfo buf);
@@ -551,7 +585,8 @@ static int64 aez_explain_time_microseconds(double seconds);
 static void aez_reset_templates(void);
 static void aez_invalidate_context_cache(void);
 static uint32 aez_template_runtime_cap(void);
-static bool aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes);
+static bool aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes,
+									  uint32 *template_id);
 static AezTemplateEntry *aez_find_template(AezTemplateKey *key);
 static AezTemplateEntry *aez_add_template(AezTemplateKey *key,
 										  uint32 plan_bytes);
@@ -983,7 +1018,7 @@ _PG_init(void)
 
 	DefineCustomStringVariable("auto_explain_z.log_filename",
 							   "strftime pattern for auto_explain_z binary log file names.",
-							   "An empty value uses the legacy backend-start-time file name. The file prefix, backend pid, rotation index, and .aez suffix are still added for per-backend isolation.",
+							   "An empty value uses the postmaster start time. The file prefix, rotation index, and .aez suffix are still added.",
 							   &auto_explain_z_log_filename,
 							   "",
 							   PGC_SUSET,
@@ -1018,7 +1053,7 @@ _PG_init(void)
 
 	DefineCustomBoolVariable("auto_explain_z.log_truncate_on_rotation",
 							 "Truncate auto_explain_z binary log files opened for time-based rotation.",
-							 "Because auto_explain_z keeps per-backend files isolated, this only affects collisions with an existing generated file name.",
+							 "This only affects collisions with an existing generated file name.",
 							 &auto_explain_z_log_truncate_on_rotation,
 							 false,
 							 PGC_SUSET,
@@ -1152,7 +1187,7 @@ aez_shmem_request(void)
 		prev_shmem_request_hook();
 
 	RequestAddinShmemSpace(aez_memsize());
-	RequestNamedLWLockTranche("auto_explain_z", 1);
+	RequestNamedLWLockTranche("auto_explain_z", 2);
 }
 
 static Size
@@ -1188,12 +1223,30 @@ aez_shmem_startup(void)
 	aez_shared = ShmemInitStruct("auto_explain_z",
 								 sizeof(AezSharedState),
 								 &found);
+	{
+		LWLockPadded *locks = GetNamedLWLockTranche("auto_explain_z");
+
+		aez_shared->template_lock = &locks[0].lock;
+		aez_shared->log_lock = &locks[1].lock;
+	}
 	if (!found)
 	{
-		aez_shared->lock = &(GetNamedLWLockTranche("auto_explain_z"))->lock;
 		aez_shared->max_templates = (uint32) Max(auto_explain_z_max_templates, 0);
 		aez_shared->template_count = 0;
+		aez_shared->next_template_id = 1;
 		aez_shared->rotation_generation = 0;
+		aez_shared->handled_rotation_generation = 0;
+		aez_shared->log_generation = 0;
+		aez_shared->file_index = 0;
+		aez_shared->file_bytes = 0;
+		aez_shared->file_uncompressed_bytes = 0;
+		aez_shared->file_opened_ts = 0;
+		aez_shared->file_compression = AEZ_COMPRESSION_NONE;
+		aez_shared->file_active = false;
+		aez_shared->directory[0] = '\0';
+		aez_shared->file_prefix[0] = '\0';
+		aez_shared->log_filename[0] = '\0';
+		aez_shared->path[0] = '\0';
 	}
 
 	memset(&ctl, 0, sizeof(ctl));
@@ -1463,7 +1516,7 @@ aez_ensure_proc_exit_registered(void)
 	if (aez_proc_exit_registered_pid == MyProcPid)
 		return;
 
-	on_proc_exit(aez_proc_exit, 0);
+	before_shmem_exit(aez_proc_exit, 0);
 	aez_proc_exit_registered_pid = MyProcPid;
 }
 
@@ -1472,6 +1525,12 @@ aez_proc_exit(int code, Datum arg)
 {
 	aez_close_file();
 	aez_reset_templates();
+}
+
+static bool
+aez_use_shared_log(void)
+{
+	return aez_shared != NULL && aez_shared->log_lock != NULL;
 }
 
 Datum
@@ -1489,11 +1548,11 @@ auto_explain_z_rotate_logfile(PG_FUNCTION_ARGS)
 static bool
 aez_request_log_rotation(void)
 {
-	if (aez_shared && aez_shared->lock)
+	if (aez_use_shared_log())
 	{
-		LWLockAcquire(aez_shared->lock, LW_EXCLUSIVE);
+		LWLockAcquire(aez_shared->log_lock, LW_EXCLUSIVE);
 		aez_shared->rotation_generation++;
-		LWLockRelease(aez_shared->lock);
+		LWLockRelease(aez_shared->log_lock);
 	}
 	else
 		aez_local_rotation_pending = true;
@@ -1509,12 +1568,13 @@ aez_rotation_requested(void)
 	if (aez_local_rotation_pending)
 		return true;
 
-	if (aez_shared == NULL || aez_shared->lock == NULL)
+	if (!aez_use_shared_log())
 		return false;
 
-	LWLockAcquire(aez_shared->lock, LW_SHARED);
-	pending = aez_shared->rotation_generation != aez_seen_rotation_generation;
-	LWLockRelease(aez_shared->lock);
+	LWLockAcquire(aez_shared->log_lock, LW_SHARED);
+	pending = aez_shared->rotation_generation !=
+		aez_shared->handled_rotation_generation;
+	LWLockRelease(aez_shared->log_lock);
 
 	return pending;
 }
@@ -1524,12 +1584,12 @@ aez_ack_rotation_request(void)
 {
 	aez_local_rotation_pending = false;
 
-	if (aez_shared == NULL || aez_shared->lock == NULL)
+	if (!aez_use_shared_log())
 		return;
 
-	LWLockAcquire(aez_shared->lock, LW_SHARED);
+	LWLockAcquire(aez_shared->log_lock, LW_SHARED);
 	aez_seen_rotation_generation = aez_shared->rotation_generation;
-	LWLockRelease(aez_shared->lock);
+	LWLockRelease(aez_shared->log_lock);
 }
 
 static bool
@@ -1896,7 +1956,7 @@ aez_build_record(StringInfo record, StringInfo payload, uint32 payload_flags,
 	Assert(payload->len >= 0);
 
 	aez_record_no++;
-	ts_delta_us = record_ts - MyStartTimestamp;
+	ts_delta_us = record_ts - PgStartTime;
 	ts_delta = ts_delta_us / 1000;
 	ts_code = aez_int_size_code(ts_delta);
 	duration_code = aez_int_size_code(duration_us);
@@ -1943,7 +2003,9 @@ aez_append_log_context(StringInfo buf)
 	uint8		backend_type_code;
 	uint8		database_oid_code;
 	uint8		user_oid_code;
+	uint8		pid_code;
 	uint8		ctrl;
+	uint8		ctrl2;
 
 	if (MyProcPort)
 	{
@@ -1956,7 +2018,8 @@ aez_append_log_context(StringInfo buf)
 				appname = MyProcPort->application_name;
 	}
 
-	if (aez_context_cache_initialized &&
+	if (AEZ_FORMAT_VERSION < 13 &&
+		aez_context_cache_initialized &&
 		aez_context_backend_type == MyBackendType &&
 		aez_context_database_id == MyDatabaseId &&
 		aez_context_user_id == GetUserId() &&
@@ -1978,9 +2041,11 @@ aez_append_log_context(StringInfo buf)
 	backend_type_code = aez_uint_size_code((uint32) MyBackendType);
 	database_oid_code = aez_uint_size_code(MyDatabaseId);
 	user_oid_code = aez_uint_size_code(GetUserId());
+	pid_code = aez_uint_size_code((uint32) MyProcPid);
 	ctrl = backend_type_code |
 		(database_oid_code << 2) |
 		(user_oid_code << 4);
+	ctrl2 = pid_code;
 
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 	if (!aez_context_cache_initialized)
@@ -1996,6 +2061,11 @@ aez_append_log_context(StringInfo buf)
 	MemoryContextSwitchTo(oldcxt);
 
 	aez_put_u8(&aez_context_cache, ctrl);
+	if (AEZ_FORMAT_VERSION >= 13)
+	{
+		aez_put_u8(&aez_context_cache, ctrl2);
+		aez_put_uint_sized(&aez_context_cache, (uint32) MyProcPid, pid_code);
+	}
 	aez_put_uint_sized(&aez_context_cache, (uint32) MyBackendType,
 					   backend_type_code);
 	aez_put_string(&aez_context_cache, backend_type, -1);
@@ -2020,6 +2090,9 @@ static bool
 aez_context_can_reference(void)
 {
 	const char *appname = application_name;
+
+	if (AEZ_FORMAT_VERSION >= 13)
+		return false;
 
 	if (MyProcPort &&
 		MyProcPort->application_name &&
@@ -2988,27 +3061,32 @@ aez_template_runtime_cap(void)
 }
 
 static bool
-aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes)
+aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes,
+						  uint32 *template_id)
 {
 	AezSharedTemplateEntry *entry;
 	bool		found;
 	bool		admitted = false;
 	uint32		cap;
 
+	*template_id = 0;
 	if (aez_shared == NULL || aez_shared_template_hash == NULL)
 		return true;
+	if (MyProc == NULL)
+		return false;
 
 	cap = aez_template_runtime_cap();
 	if (cap == 0)
 		return false;
 
-	LWLockAcquire(aez_shared->lock, LW_EXCLUSIVE);
+	LWLockAcquire(aez_shared->template_lock, LW_EXCLUSIVE);
 	entry = (AezSharedTemplateEntry *) hash_search(aez_shared_template_hash,
 												  key, HASH_FIND, &found);
 	if (found)
 	{
 		if (entry->plan_bytes < plan_bytes)
 			entry->plan_bytes = plan_bytes;
+		*template_id = entry->template_id;
 		admitted = true;
 	}
 	else if (aez_shared->template_count < cap)
@@ -3017,14 +3095,34 @@ aez_shared_template_admit(AezTemplateKey *key, uint32 plan_bytes)
 													  key, HASH_ENTER, &found);
 		if (!found)
 		{
+			entry->template_id = aez_shared->next_template_id++;
 			entry->plan_bytes = plan_bytes;
 			aez_shared->template_count++;
 		}
+		*template_id = entry->template_id;
 		admitted = true;
 	}
-	LWLockRelease(aez_shared->lock);
+	LWLockRelease(aez_shared->template_lock);
 
 	return admitted;
+}
+
+static void
+aez_reset_shared_templates_locked(void)
+{
+	HASH_SEQ_STATUS status;
+	AezSharedTemplateEntry *entry;
+
+	if (aez_shared == NULL || aez_shared_template_hash == NULL)
+		return;
+
+	LWLockAcquire(aez_shared->template_lock, LW_EXCLUSIVE);
+	hash_seq_init(&status, aez_shared_template_hash);
+	while ((entry = (AezSharedTemplateEntry *) hash_seq_search(&status)) != NULL)
+		(void) hash_search(aez_shared_template_hash, &entry->key,
+						   HASH_REMOVE, NULL);
+	aez_shared->template_count = 0;
+	LWLockRelease(aez_shared->template_lock);
 }
 
 static AezTemplateEntry *
@@ -3044,11 +3142,12 @@ aez_add_template(AezTemplateKey *key, uint32 plan_bytes)
 	AezTemplateEntry *entry;
 	bool		found;
 	uint32		cap;
+	uint32		shared_template_id = 0;
 
 	cap = aez_template_runtime_cap();
 	if (cap == 0 || aez_template_count >= cap)
 		return NULL;
-	if (!aez_shared_template_admit(key, plan_bytes))
+	if (!aez_shared_template_admit(key, plan_bytes, &shared_template_id))
 		return NULL;
 
 	if (aez_template_hash == NULL)
@@ -3069,7 +3168,8 @@ aez_add_template(AezTemplateKey *key, uint32 plan_bytes)
 	if (found)
 		return entry;
 
-	entry->template_id = aez_next_template_id++;
+	entry->template_id = shared_template_id ?
+		shared_template_id : aez_next_template_id++;
 	entry->plan_bytes = plan_bytes;
 	aez_template_count++;
 	return entry;
@@ -3136,7 +3236,8 @@ aez_write_record(StringInfo record)
 			return false;
 		}
 
-		aez_file_uncompressed_bytes += record->len;
+		if (!aez_use_shared_log())
+			aez_file_uncompressed_bytes += record->len;
 		return true;
 	}
 
@@ -3163,7 +3264,8 @@ aez_write_record(StringInfo record)
 		}
 	}
 
-	aez_file_uncompressed_bytes += record->len;
+	if (!aez_use_shared_log())
+		aez_file_uncompressed_bytes += record->len;
 	return true;
 }
 
@@ -3172,6 +3274,28 @@ aez_file_preflight_needed(void)
 {
 	uint64		max_bytes;
 	TimestampTz now;
+
+	if (aez_use_shared_log())
+	{
+		if (aez_fd < 0)
+			return true;
+		if (aez_file_generation != aez_shared->log_generation ||
+			aez_shared->rotation_generation !=
+			aez_shared->handled_rotation_generation)
+			return true;
+		if (aez_current_directory_guc != auto_explain_z_directory ||
+			aez_current_prefix_guc != auto_explain_z_file_prefix ||
+			aez_current_log_filename_guc != auto_explain_z_log_filename)
+			return true;
+		if (aez_file_compression != aez_select_compression())
+			return true;
+		if (aez_local_rotation_pending)
+			return true;
+		now = GetCurrentTimestamp();
+		if (aez_file_age_exceeded(now))
+			return true;
+		return false;
+	}
 
 	if (aez_fd < 0)
 		return true;
@@ -3211,6 +3335,23 @@ aez_open_file(uint64 needed)
 
 	if (aez_writer_failed)
 		return false;
+
+	if (aez_use_shared_log())
+	{
+		bool		ok;
+		bool		created_new_file = false;
+
+		if (MyProc == NULL)
+			return false;
+
+		now = GetCurrentTimestamp();
+		LWLockAcquire(aez_shared->log_lock, LW_EXCLUSIVE);
+		ok = aez_open_file_locked(needed, now, &created_new_file);
+		LWLockRelease(aez_shared->log_lock);
+		if (ok && created_new_file)
+			aez_cleanup_logs(false);
+		return ok;
+	}
 
 	wanted_compression = aez_select_compression();
 	settings_changed = aez_fd >= 0 &&
@@ -3274,7 +3415,7 @@ aez_open_file(uint64 needed)
 		open_flags |= O_EXCL;
 	for (;;)
 	{
-		path = aez_build_log_filename();
+		path = aez_build_log_filename(aez_file_index);
 		aez_fd = BasicOpenFile(path, open_flags);
 		if (aez_fd >= 0)
 			break;
@@ -3347,22 +3488,280 @@ aez_open_file(uint64 needed)
 	return true;
 }
 
+static bool
+aez_open_file_locked(uint64 needed, TimestampTz now, bool *created_new_file)
+{
+	uint64		max_bytes;
+	bool		settings_changed;
+	bool		rotation_requested;
+	bool		time_rotation;
+	bool		size_rotation;
+	bool		compression_rotation;
+	bool		truncate_on_open = false;
+	int			wanted_compression;
+
+	Assert(aez_use_shared_log());
+
+	if (created_new_file)
+		*created_new_file = false;
+
+	wanted_compression = aez_select_compression();
+	settings_changed = aez_shared_settings_changed_locked();
+	rotation_requested = aez_local_rotation_pending ||
+		aez_shared->rotation_generation !=
+		aez_shared->handled_rotation_generation;
+	time_rotation = aez_shared->file_active &&
+		auto_explain_z_log_rotation_age > 0 &&
+		aez_shared->file_opened_ts != 0 &&
+		TimestampDifferenceExceedsSeconds(aez_shared->file_opened_ts, now,
+										  auto_explain_z_log_rotation_age * 60);
+	max_bytes = (uint64) auto_explain_z_log_rotation_size * 1024;
+	size_rotation = aez_shared->file_active &&
+		max_bytes > 0 &&
+		needed > 0 &&
+		aez_shared->file_uncompressed_bytes > 0 &&
+		aez_shared->file_uncompressed_bytes + needed > max_bytes;
+	compression_rotation = aez_shared->file_active &&
+		aez_shared->file_compression != wanted_compression;
+
+	if (settings_changed)
+		aez_rotate_shared_file_locked(now, true);
+	else if (aez_shared->file_active &&
+			 (rotation_requested || time_rotation ||
+			  size_rotation || compression_rotation))
+	{
+		truncate_on_open = time_rotation &&
+			auto_explain_z_log_truncate_on_rotation;
+		aez_rotate_shared_file_locked(now, false);
+	}
+
+	aez_local_rotation_pending = false;
+	aez_seen_rotation_generation = aez_shared->rotation_generation;
+
+	if (!aez_shared->file_active)
+	{
+		if (!aez_create_shared_file_locked(now, truncate_on_open))
+			return false;
+		if (rotation_requested)
+			aez_shared->handled_rotation_generation =
+				aez_shared->rotation_generation;
+		if (created_new_file)
+			*created_new_file = true;
+	}
+
+	return aez_open_shared_file_for_backend();
+}
+
+static void
+aez_rotate_shared_file_locked(TimestampTz now, bool reset_index)
+{
+	(void) now;
+
+	if (reset_index)
+		aez_shared->file_index = 0;
+	else
+		aez_shared->file_index++;
+
+	aez_shared->file_active = false;
+	aez_shared->file_bytes = 0;
+	aez_shared->file_uncompressed_bytes = 0;
+	aez_shared->file_opened_ts = 0;
+	aez_shared->file_compression = AEZ_COMPRESSION_NONE;
+	aez_shared->path[0] = '\0';
+	aez_shared->log_generation++;
+	aez_shared->handled_rotation_generation =
+		aez_shared->rotation_generation;
+	aez_reset_shared_templates_locked();
+
+	if (aez_fd >= 0)
+		aez_close_file_descriptor();
+	aez_file_opened_ts = 0;
+	aez_reset_templates();
+	aez_invalidate_context_cache();
+}
+
+static bool
+aez_shared_settings_changed_locked(void)
+{
+	if (!aez_shared->file_active)
+		return false;
+
+	return strcmp(aez_shared->directory, auto_explain_z_directory) != 0 ||
+		strcmp(aez_shared->file_prefix, auto_explain_z_file_prefix) != 0 ||
+		strcmp(aez_shared->log_filename, auto_explain_z_log_filename) != 0;
+}
+
+static bool
+aez_create_shared_file_locked(TimestampTz now, bool truncate_on_open)
+{
+	StringInfoData header;
+	char	   *path;
+	int			fd;
+	int			open_flags;
+	int			wanted_compression;
+
+	if (MakePGDirectory(auto_explain_z_directory) < 0 && errno != EEXIST)
+	{
+		aez_writer_warning("could not create auto_explain_z binary log directory");
+		return false;
+	}
+
+	wanted_compression = aez_select_compression();
+	open_flags = O_WRONLY | O_CREAT | PG_BINARY;
+	if (truncate_on_open)
+		open_flags |= O_TRUNC;
+	else
+		open_flags |= O_EXCL;
+
+	for (;;)
+	{
+		path = aez_build_log_filename(aez_shared->file_index);
+		fd = BasicOpenFile(path, open_flags);
+		if (fd >= 0)
+			break;
+		if (!truncate_on_open && errno == EEXIST)
+		{
+			pfree(path);
+			aez_shared->file_index++;
+			continue;
+		}
+		aez_writer_warning("could not open auto_explain_z binary log file");
+		pfree(path);
+		return false;
+	}
+	ReserveExternalFD();
+
+	if (aez_fd >= 0)
+		aez_close_file_descriptor();
+
+	aez_fd = fd;
+	aez_file_index = aez_shared->file_index;
+	aez_file_generation = aez_shared->log_generation;
+	aez_file_compression = wanted_compression;
+	aez_file_opened_ts = now;
+	aez_file_bytes = 0;
+	aez_file_uncompressed_bytes = 0;
+
+	initStringInfo(&header);
+	aez_build_file_header(&header);
+	if (!aez_write_all(aez_fd, header.data, header.len))
+	{
+		aez_close_file_descriptor();
+		aez_writer_warning("could not write auto_explain_z binary log file header");
+		pfree(path);
+		return false;
+	}
+
+	strlcpy(aez_shared->directory, auto_explain_z_directory,
+			sizeof(aez_shared->directory));
+	strlcpy(aez_shared->file_prefix, auto_explain_z_file_prefix,
+			sizeof(aez_shared->file_prefix));
+	strlcpy(aez_shared->log_filename, auto_explain_z_log_filename,
+			sizeof(aez_shared->log_filename));
+	strlcpy(aez_shared->path, path, sizeof(aez_shared->path));
+	aez_shared->file_bytes = header.len;
+	aez_shared->file_uncompressed_bytes = 0;
+	aez_shared->file_opened_ts = now;
+	aez_shared->file_compression = wanted_compression;
+	aez_shared->file_active = true;
+
+	aez_file_bytes = aez_shared->file_bytes;
+	aez_remember_current_file(path, auto_explain_z_directory,
+							  auto_explain_z_file_prefix);
+	pfree(path);
+	return true;
+}
+
+static bool
+aez_open_shared_file_for_backend(void)
+{
+	bool		generation_changed;
+
+	if (!aez_shared->file_active || aez_shared->path[0] == '\0')
+		return false;
+
+	generation_changed = aez_file_generation != aez_shared->log_generation;
+	if (aez_fd >= 0 && !generation_changed)
+		return true;
+
+	if (aez_fd >= 0)
+		aez_close_file_descriptor();
+
+	aez_fd = BasicOpenFile(aez_shared->path, O_WRONLY | PG_BINARY);
+	if (aez_fd < 0)
+	{
+		aez_writer_warning("could not open shared auto_explain_z binary log file");
+		return false;
+	}
+	ReserveExternalFD();
+
+	aez_file_index = aez_shared->file_index;
+	aez_file_generation = aez_shared->log_generation;
+	aez_file_bytes = aez_shared->file_bytes;
+	aez_file_uncompressed_bytes = aez_shared->file_uncompressed_bytes;
+	aez_file_compression = aez_shared->file_compression;
+	aez_file_opened_ts = aez_shared->file_opened_ts;
+	aez_seen_rotation_generation = aez_shared->rotation_generation;
+
+	if (generation_changed)
+	{
+		aez_reset_templates();
+		aez_invalidate_context_cache();
+	}
+
+	aez_remember_current_file(aez_shared->path, aez_shared->directory,
+							  aez_shared->file_prefix);
+	return true;
+}
+
+static void
+aez_remember_current_file(const char *path, const char *directory,
+						  const char *prefix)
+{
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	if (aez_current_path)
+		pfree(aez_current_path);
+	aez_current_path = pstrdup(path);
+	if (aez_current_directory)
+		pfree(aez_current_directory);
+	aez_current_directory = pstrdup(directory);
+	if (aez_current_prefix)
+		pfree(aez_current_prefix);
+	aez_current_prefix = pstrdup(prefix);
+	aez_current_directory_guc = auto_explain_z_directory;
+	aez_current_prefix_guc = auto_explain_z_file_prefix;
+	aez_current_log_filename_guc = auto_explain_z_log_filename;
+	MemoryContextSwitchTo(oldcxt);
+}
+
 static void
 aez_close_file(void)
 {
 	if (aez_fd >= 0)
 	{
 		(void) aez_flush_pending();
-		(void) aez_finish_compression();
-		(void) close(aez_fd);
-		aez_fd = -1;
-		ReleaseExternalFD();
+		if (!aez_use_shared_log())
+			(void) aez_finish_compression();
+		aez_close_file_descriptor();
 	}
 	aez_file_opened_ts = 0;
 }
 
+static void
+aez_close_file_descriptor(void)
+{
+	if (aez_fd >= 0)
+	{
+		(void) close(aez_fd);
+		aez_fd = -1;
+		ReleaseExternalFD();
+	}
+}
+
 static char *
-aez_build_log_filename(void)
+aez_build_log_filename(uint64 file_index)
 {
 	if (auto_explain_z_log_filename != NULL &&
 		auto_explain_z_log_filename[0] != '\0')
@@ -3378,20 +3777,34 @@ aez_build_log_filename(void)
 		if (len == 0)
 			snprintf(filename, sizeof(filename), "%ld", (long) now);
 
-		return psprintf("%s/%s-%s-%d-" UINT64_FORMAT ".aez",
-						auto_explain_z_directory,
-						auto_explain_z_file_prefix,
-						filename,
-						MyProcPid,
-						aez_file_index);
+		if (aez_use_shared_log())
+			return psprintf("%s/%s-%s-" UINT64_FORMAT ".aez",
+							auto_explain_z_directory,
+							auto_explain_z_file_prefix,
+							filename,
+							file_index);
+		else
+			return psprintf("%s/%s-%s-%d-" UINT64_FORMAT ".aez",
+							auto_explain_z_directory,
+							auto_explain_z_file_prefix,
+							filename,
+							MyProcPid,
+							file_index);
 	}
 
-	return psprintf("%s/%s-%ld-%d-" UINT64_FORMAT ".aez",
-					auto_explain_z_directory,
-					auto_explain_z_file_prefix,
-					(long) MyStartTime,
-					MyProcPid,
-					aez_file_index);
+	if (aez_use_shared_log())
+		return psprintf("%s/%s-%ld-" UINT64_FORMAT ".aez",
+						auto_explain_z_directory,
+						auto_explain_z_file_prefix,
+						(long) timestamptz_to_time_t(PgStartTime),
+						file_index);
+	else
+		return psprintf("%s/%s-%ld-%d-" UINT64_FORMAT ".aez",
+						auto_explain_z_directory,
+						auto_explain_z_file_prefix,
+						(long) MyStartTime,
+						MyProcPid,
+						file_index);
 }
 
 static int
@@ -3570,6 +3983,9 @@ aez_flush_pending(void)
 static bool
 aez_write_file_data(const char *data, size_t len)
 {
+	if (aez_use_shared_log())
+		return aez_write_shared_file_data(data, len);
+
 	switch ((AezCompression) aez_file_compression)
 	{
 		case AEZ_COMPRESSION_LZ4:
@@ -3644,6 +4060,150 @@ aez_write_file_data(const char *data, size_t len)
 			return true;
 	}
 	return false;
+}
+
+static bool
+aez_write_shared_file_data(const char *data, size_t len)
+{
+	char	   *compressed = NULL;
+	const char *write_data = data;
+	size_t		write_len = len;
+	uint64		offset = 0;
+	uint64		generation;
+	int			compression;
+	bool		ok = false;
+	bool		created_new_file = false;
+
+	if (len == 0)
+		return true;
+
+retry:
+	if (MyProc == NULL)
+		return false;
+
+	LWLockAcquire(aez_shared->log_lock, LW_EXCLUSIVE);
+	ok = aez_open_file_locked((uint64) len, GetCurrentTimestamp(),
+							  &created_new_file);
+	if (ok)
+	{
+		generation = aez_shared->log_generation;
+		compression = aez_shared->file_compression;
+	}
+	LWLockRelease(aez_shared->log_lock);
+	if (!ok)
+		return false;
+	if (created_new_file)
+		aez_cleanup_logs(false);
+
+	if (compression != AEZ_COMPRESSION_NONE)
+	{
+		compressed = aez_compress_shared_chunk(data, len, compression,
+											   &write_len);
+		if (compressed == NULL)
+			return false;
+		write_data = compressed;
+	}
+
+	LWLockAcquire(aez_shared->log_lock, LW_EXCLUSIVE);
+	if (!aez_shared->file_active ||
+		aez_shared->log_generation != generation ||
+		aez_shared->file_compression != compression)
+	{
+		LWLockRelease(aez_shared->log_lock);
+		if (compressed)
+			pfree(compressed);
+		compressed = NULL;
+		write_data = data;
+		write_len = len;
+		goto retry;
+	}
+
+	if (!aez_open_shared_file_for_backend())
+	{
+		LWLockRelease(aez_shared->log_lock);
+		if (compressed)
+			pfree(compressed);
+		return false;
+	}
+
+	offset = aez_shared->file_bytes;
+	aez_shared->file_bytes += write_len;
+	aez_shared->file_uncompressed_bytes += len;
+	aez_file_bytes = aez_shared->file_bytes;
+	aez_file_uncompressed_bytes = aez_shared->file_uncompressed_bytes;
+	LWLockRelease(aez_shared->log_lock);
+
+	ok = aez_write_all_at(aez_fd, write_data, write_len, offset);
+	if (compressed)
+		pfree(compressed);
+
+	return ok;
+}
+
+static char *
+aez_compress_shared_chunk(const char *data, size_t len, int compression,
+						  size_t *out_len)
+{
+	switch ((AezCompression) compression)
+	{
+		case AEZ_COMPRESSION_LZ4:
+#ifdef USE_LZ4
+			{
+				LZ4F_preferences_t prefs;
+				size_t		bound;
+				size_t		written;
+				char	   *out;
+
+				memset(&prefs, 0, sizeof(prefs));
+				prefs.compressionLevel = 0;
+				prefs.frameInfo.blockMode = LZ4F_blockLinked;
+				bound = LZ4F_compressFrameBound(len, &prefs);
+				if (bound == 0 || bound > MaxAllocSize)
+					return NULL;
+				out = palloc(bound);
+				written = LZ4F_compressFrame(out, bound, data, len, &prefs);
+				if (LZ4F_isError(written))
+				{
+					pfree(out);
+					return NULL;
+				}
+				*out_len = written;
+				return out;
+			}
+#else
+			return NULL;
+#endif
+
+		case AEZ_COMPRESSION_ZSTD:
+#ifdef USE_ZSTD
+			{
+				size_t		bound;
+				size_t		written;
+				char	   *out;
+
+				bound = ZSTD_compressBound(len);
+				if (bound == 0 || bound > MaxAllocSize)
+					return NULL;
+				out = palloc(bound);
+				written = ZSTD_compress(out, bound, data, len,
+										auto_explain_z_zstd_level);
+				if (ZSTD_isError(written))
+				{
+					pfree(out);
+					return NULL;
+				}
+				*out_len = written;
+				return out;
+			}
+#else
+			return NULL;
+#endif
+
+		case AEZ_COMPRESSION_NONE:
+			break;
+	}
+
+	return NULL;
 }
 
 static void
@@ -3789,9 +4349,9 @@ aez_build_file_header(StringInfo buf)
 	aez_put_u16(buf, (uint16) aez_file_compression);
 	aez_put_u16(buf, 0);		/* file flags */
 	aez_put_u32(buf, PG_VERSION_NUM);
-	aez_put_i64(buf, MyStartTimestamp);
-	aez_put_i64(buf, (int64) MyStartTime);
-	aez_put_u32(buf, (uint32) MyProcPid);
+	aez_put_i64(buf, PgStartTime);
+	aez_put_i64(buf, (int64) timestamptz_to_time_t(PgStartTime));
+	aez_put_u32(buf, (uint32) PostmasterPid);
 	aez_put_u32(buf, 0);		/* reserved */
 }
 
@@ -3816,6 +4376,34 @@ aez_write_all(int fd, const char *data, size_t len)
 
 		p += written;
 		len -= written;
+	}
+
+	return true;
+}
+
+static bool
+aez_write_all_at(int fd, const char *data, size_t len, uint64 offset)
+{
+	const char *p = data;
+	off_t		pos = (off_t) offset;
+
+	while (len > 0)
+	{
+		ssize_t		written;
+
+		written = pwrite(fd, p, len, pos);
+		if (written < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (written == 0)
+			return false;
+
+		p += written;
+		len -= written;
+		pos += written;
 	}
 
 	return true;

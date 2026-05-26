@@ -392,16 +392,16 @@ def decompress_file_body(method, data):
         return data
     if method == COMPRESSION_LZ4:
         try:
-            import lz4.frame
-            return lz4.frame.decompress(data)
-        except Exception:
-            pass
-        try:
             proc = subprocess.run(["lz4", "-dc"], input=data,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE,
                                   check=True)
             return proc.stdout
+        except Exception:
+            pass
+        try:
+            import lz4.frame
+            return lz4.frame.decompress(data)
         except Exception:
             pass
         raise DecodeError("lz4 file stream requires python-lz4 or lz4")
@@ -783,11 +783,14 @@ def parse_payload(payload, record_header, templates):
             context = copy.deepcopy(templates["__context"])
             context["Timestamp"] = record_header.get("Timestamp")
         else:
+            context_ctrl2 = r.u8() if version >= 13 else 0
             context = {
                 "Timestamp": record_header.get("Timestamp"),
                 "Backend Start": record_header.get("File", {}).get("Backend Start"),
                 "Backend Start Epoch": record_header.get("File", {}).get("Backend Start Epoch"),
-                "PID": record_header.get("File", {}).get("PID"),
+                "PID": (r.uint_sized(context_ctrl2 & 0x03)
+                        if version >= 13
+                        else record_header.get("File", {}).get("PID")),
                 "Backend Type ID": r.uint_sized(context_ctrl & 0x03),
                 "Backend Type": r.string(),
                 "Database OID": r.uint_sized((context_ctrl >> 2) & 0x03),

@@ -4,9 +4,9 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 exec "$script_dir/auto_explain_z_bench" \
-	--workloads shape-simple-point,shape-complex,shape-very-complex,shape-node-suite \
-	--auto-explain-formats text,json \
+	--workloads select-only,simple-update,tpcb-like,shape-simple-point,shape-simple-range,shape-join-agg,shape-complex,shape-very-complex,shape-node-suite \
+	--auto-explain-formats text,json,yaml,xml \
 	--aez-profiles simple,full \
-	--compressions none,lz4,zstd \
+	--compressions lz4,zstd \
 	--template-modes on,off \
 	"$@"

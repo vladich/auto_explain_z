@@ -222,8 +222,8 @@ RESET enable_seqscan;
 my $json = decode_dir($log_dir, 'json');
 like($json, qr/"Query Text": "SELECT \* FROM aez_t WHERE id = 7;"/,
 	'query text decoded from binary log');
-like($json, qr/"Format Version": 12/,
-	'v12 binary log decoded');
+like($json, qr/"Format Version": 13/,
+	'v13 binary log decoded');
 like($json, qr/"Plan Identifier": \d+/,
 	'plan identifier decoded from binary log');
 like($json, qr/"Compression": "none"/,

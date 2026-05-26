@@ -697,6 +697,13 @@ class Cluster:
         self.stderr_file = None
         self.proc = None
 
+    def reset_pgdata(self, base_pgdata):
+        if self.proc is not None:
+            raise BenchError("cannot reset PGDATA while server is running")
+        if self.pgdata.exists():
+            shutil.rmtree(self.pgdata)
+        shutil.copytree(base_pgdata, self.pgdata, symlinks=True)
+
     def pgbench_command(self, seconds, workload):
         if workload not in WORKLOAD_OPTIONS:
             raise BenchError(f"unknown workload: {workload}")
@@ -758,6 +765,85 @@ class Cluster:
                     stderr.strip()).strip()
             )
         return stdout, max_cpu
+
+    def prewarm_database(self, workload):
+        sql = r"""
+SELECT set_config('auto_explain.log_min_duration', '-1', true);
+SELECT set_config('auto_explain_z.log_min_duration', '-1', true);
+SET statement_timeout = 0;
+SET client_min_messages = warning;
+DO $aez_prewarm$
+DECLARE
+    relname text;
+    rels text[] := ARRAY[
+        'pgbench_accounts',
+        'pgbench_branches',
+        'pgbench_tellers',
+        'pgbench_history',
+        'aez_customer',
+        'aez_order',
+        'aez_event',
+        'aez_bitmap',
+        'aez_part',
+        'aez_parallel',
+        'aez_mod'
+    ];
+BEGIN
+    FOREACH relname IN ARRAY rels LOOP
+        IF to_regclass('public.' || relname) IS NOT NULL THEN
+            EXECUTE format('SELECT count(*) FROM %I', relname);
+        END IF;
+    END LOOP;
+
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+
+    IF to_regclass('public.pgbench_accounts') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM pgbench_accounts WHERE aid BETWEEN 1 AND 2147483647';
+    END IF;
+    IF to_regclass('public.pgbench_branches') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM pgbench_branches WHERE bid BETWEEN 1 AND 2147483647';
+    END IF;
+    IF to_regclass('public.pgbench_tellers') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM pgbench_tellers WHERE tid BETWEEN 1 AND 2147483647';
+    END IF;
+    IF to_regclass('public.aez_customer') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_customer WHERE id BETWEEN 1 AND 2147483647';
+    END IF;
+    IF to_regclass('public.aez_order') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_order WHERE customer_id BETWEEN 1 AND 2147483647';
+        EXECUTE $$SELECT count(*) FROM aez_order
+                  WHERE status IN ('paid', 'open')
+                    AND customer_id BETWEEN 1 AND 2147483647$$;
+        EXECUTE $$SELECT count(*) FROM aez_order
+                  WHERE created_at >= DATE '2024-01-01'$$;
+    END IF;
+    IF to_regclass('public.aez_event') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_event WHERE order_id BETWEEN 1 AND 2147483647';
+        EXECUTE $$SELECT count(*) FROM aez_event
+                  WHERE event_type IN ('ship', 'pay', 'note')
+                    AND order_id BETWEEN 1 AND 2147483647$$;
+    END IF;
+    IF to_regclass('public.aez_bitmap') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_bitmap WHERE a BETWEEN 0 AND 999';
+        EXECUTE 'SELECT count(*) FROM aez_bitmap WHERE b BETWEEN 0 AND 999';
+    END IF;
+    IF to_regclass('public.aez_part') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_part WHERE id BETWEEN 1 AND 2147483647';
+    END IF;
+    IF to_regclass('public.aez_mod') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM aez_mod WHERE id BETWEEN 1 AND 2147483647';
+    END IF;
+END
+$aez_prewarm$;
+"""
+        run([
+            self.paths["psql"],
+            "-XAtq",
+            "-d", self.args.database,
+            "-v", "ON_ERROR_STOP=1",
+            "-c", sql,
+        ], env=self.env(f"auto_explain_z_bench_prewarm_{workload}"),
+           capture=not self.args.verbose)
 
     def prepare_pgbench(self):
         scenario = self.paths["work"] / "prepare"
@@ -993,7 +1079,7 @@ def scenario_gucs(args, scenario, aez_dir):
         raise BenchError(f"unknown scenario: {scenario}")
     profile = config["profile"]
     gucs = {
-        "session_preload_libraries": "auto_explain_z",
+        "shared_preload_libraries": "auto_explain_z",
         "auto_explain_z.log_min_duration": "0",
         "auto_explain_z.sample_rate": str(args.sample_rate),
         "auto_explain_z.log_analyze": analyze,
@@ -1020,7 +1106,11 @@ def run_scenario(cluster, args, name, workload, iteration):
     aez_dir.mkdir(parents=True, exist_ok=True)
     gucs = scenario_gucs(args, name, aez_dir)
     stderr_path = cluster.start(scenario_dir, gucs)
+    stopped = False
     try:
+        if args.prewarm:
+            cluster.prewarm_database(workload)
+
         if args.warmup > 0:
             cluster.pgbench(args.warmup, f"{name}_{workload}_warmup",
                             workload)
@@ -1040,6 +1130,9 @@ def run_scenario(cluster, args, name, workload, iteration):
         child_cpu = child_cpu_snapshot() - child_cpu_start
         server_cpu = server_cpu_end - server_cpu_start
         log_bytes = file_size(stderr_path) - log_start
+        aez_runtime_bytes = dir_size(aez_dir) - aez_start
+        cluster.stop()
+        stopped = True
         aez_bytes = dir_size(aez_dir) - aez_start
         parsed = parse_pgbench(output)
 
@@ -1049,6 +1142,7 @@ def run_scenario(cluster, args, name, workload, iteration):
             "scenario": name,
             "workload": workload,
             "iteration": iteration,
+            "prewarm": args.prewarm,
             "scenario_config": scenario_metadata(args, name),
             "pgbench": parsed,
             "wall_seconds": wall,
@@ -1056,6 +1150,7 @@ def run_scenario(cluster, args, name, workload, iteration):
             "pgbench_cpu_seconds": child_cpu,
             "regular_log_bytes": log_bytes,
             "auto_explain_z_bytes": aez_bytes,
+            "auto_explain_z_runtime_bytes": aez_runtime_bytes,
             "total_plan_log_bytes": total_log_bytes,
             "bytes_per_transaction": (total_log_bytes / tx) if tx else None,
             "stderr_path": str(stderr_path),
@@ -1063,7 +1158,8 @@ def run_scenario(cluster, args, name, workload, iteration):
         }
         return result
     finally:
-        cluster.stop()
+        if not stopped:
+            cluster.stop()
 
 
 def summarize_results(results):
@@ -1171,6 +1267,12 @@ def parse_args(argv):
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--prewarm", action="store_true",
+                        help="scan benchmark relations and common index paths before each timed run")
+    parser.add_argument("--reset-between-scenarios", action="store_true",
+                        help="restore the prepared PGDATA before each scenario")
+    parser.add_argument("--burnin-baseline", action="store_true",
+                        help="run and discard an initial baseline scenario for each workload")
     parser.add_argument("--iterations", type=int, default=1,
                         help="number of measured runs per workload/scenario")
     parser.add_argument("--workloads", default="select-only",
@@ -1272,9 +1374,16 @@ def main(argv):
 
     cluster = Cluster(args, paths, pg_root, aez_root)
     results = []
+    success = False
     try:
         cluster.initdb()
         cluster.prepare_pgbench()
+        base_pgdata = None
+        if args.reset_between_scenarios:
+            base_pgdata = paths["work"] / "base_data"
+            if base_pgdata.exists():
+                shutil.rmtree(base_pgdata)
+            shutil.move(str(cluster.pgdata), str(base_pgdata))
 
         scenarios = []
         if not args.skip_baseline:
@@ -1316,8 +1425,16 @@ def main(argv):
                 raise BenchError(f"unknown workload: {workload}")
 
         for workload in workloads:
+            if args.burnin_baseline:
+                if args.reset_between_scenarios:
+                    cluster.reset_pgdata(base_pgdata)
+                print(f"running {workload} baseline burn-in...",
+                      flush=True)
+                run_scenario(cluster, args, "baseline", workload, 0)
             for iteration in range(1, args.iterations + 1):
                 for scenario in scenarios:
+                    if args.reset_between_scenarios:
+                        cluster.reset_pgdata(base_pgdata)
                     print(f"running {workload} {scenario} iteration {iteration}...",
                           flush=True)
                     results.append(run_scenario(cluster, args, scenario,
@@ -1335,11 +1452,16 @@ def main(argv):
             print(f"workdir removed: {work}")
         else:
             print(f"workdir: {work}")
+        success = True
     finally:
         cluster.stop()
         shutil.rmtree(paths["sock"], ignore_errors=True)
         if cleanup:
-            shutil.rmtree(work, ignore_errors=True)
+            if work.exists():
+                shutil.rmtree(work, ignore_errors=True)
+                if not success:
+                    print(f"workdir removed after failure: {work}",
+                          file=sys.stderr)
 
 
 if __name__ == "__main__":

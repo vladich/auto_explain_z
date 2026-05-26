@@ -108,6 +108,23 @@ sub workload_sql
 	return $sql;
 }
 
+sub try_psql_sql
+{
+	my ($node, $sql) = @_;
+	my ($stdout, $stderr) = ('', '');
+	my @cmd = (
+		$node->installed_command('psql'),
+		'--no-psqlrc',
+		'--no-align',
+		'--tuples-only',
+		'--quiet',
+		'--set' => 'ON_ERROR_STOP=1',
+		'--dbname' => $node->connstr('postgres'),
+		'--file' => '-');
+	my $ok = IPC::Run::run \@cmd, '<', \$sql, '>' => \$stdout, '2>' => \$stderr;
+	return ($ok, $stdout, $stderr);
+}
+
 my $node = PostgreSQL::Test::Cluster->new('hardening');
 $node->init;
 
@@ -209,10 +226,30 @@ like($rotate_result, qr/^t$/m,
 	'auto_explain_z_rotate_logfile reports a successful rotation request');
 my @manual_rotation_files = aez_files($manual_rotation_dir, 'manual');
 ok(scalar(@manual_rotation_files) >= 2,
-	'manual rotation creates a new binary log file in the current backend');
+	'manual rotation creates a new shared binary log file');
 my $manual_rotation_json = decode_pg_json_files(@manual_rotation_files);
 like($manual_rotation_json, qr/"Node Type": "Aggregate"/,
 	'decoder reads manually rotated files');
+
+my $external_rotate_result = $node->safe_psql(
+	'postgres',
+	q{SELECT auto_explain_z_rotate_logfile();});
+like($external_rotate_result, qr/^t$/m,
+	'external backend can request shared log rotation');
+$node->safe_psql(
+	'postgres',
+	"SET auto_explain_z.directory = " . sql_string($manual_rotation_dir) . q{;
+SET auto_explain_z.file_prefix = 'manual';
+SET auto_explain_z.log_min_duration = 0;
+SET auto_explain_z.profile = simple;
+SET auto_explain_z.compression = none;
+SET auto_explain_z.pending_buffer_size = 0;
+SET auto_explain_z.template_cache = off;
+SELECT count(*) FROM aez_harden WHERE id BETWEEN 51 AND 60;
+});
+@manual_rotation_files = aez_files($manual_rotation_dir, 'manual');
+ok(scalar(@manual_rotation_files) >= 3,
+	'external rotation request creates the next shared binary log');
 
 my $large_query_text = 'x' x 4096;
 $node->safe_psql(
@@ -253,7 +290,7 @@ my @filename_rotation_files = aez_files($filename_rotation_dir, 'named');
 ok(scalar(@filename_rotation_files) == 1,
 	'log_filename pattern creates a matching binary log file');
 like(basename($filename_rotation_files[0]),
-	qr/^named-aez-\d{14}-\d+-0\.aez$/,
+	qr/^named-aez-\d{14}-0\.aez$/,
 	'log_filename strftime pattern is included in the generated file name');
 
 my $bad_magic = "$data_dir/aez_bad_magic.aez";
@@ -346,10 +383,56 @@ for my $job (@jobs)
 }
 
 my @multi_files = aez_files($multi_dir, 'multi');
-ok(scalar(@multi_files) >= 4, 'concurrent backends wrote separate binary logs');
+is(scalar(@multi_files), 1, 'concurrent backends wrote one shared binary log');
 my $multi_json = decode_pg_json_files(@multi_files);
 like($multi_json, qr/"Node Type": "Aggregate"/,
 	'decoder reads logs produced by concurrent backends');
+my $multi_raw = decode_raw_json_dir($multi_dir);
+my %multi_pids;
+for my $record (@$multi_raw)
+{
+	$multi_pids{ $record->{'Log Context'}->{PID} } = 1
+	  if defined $record->{'Log Context'}->{PID};
+}
+ok(scalar(keys %multi_pids) >= 4,
+	'shared binary log preserves backend pid context');
+
+for my $compression ('lz4', 'zstd')
+{
+	my $compressed_dir = "$data_dir/aez_shared_compressed_$compression";
+	my $large_query_text = 'z' x 4096;
+	my ($ok, $stdout, $stderr) = try_psql_sql(
+		$node,
+		"SET auto_explain_z.directory = " . sql_string($compressed_dir) . q{;
+	SET auto_explain_z.file_prefix = 'shared-compressed-} . $compression . q{';
+	SET auto_explain_z.log_min_duration = 0;
+	SET auto_explain_z.profile = simple;
+	SET auto_explain_z.pending_buffer_size = 1;
+	SET auto_explain_z.template_cache = off;
+	SET auto_explain_z.compression = } . sql_string($compression) . q{;
+	SELECT length(} . sql_string($large_query_text) . q{);
+	SELECT length(} . sql_string($large_query_text) . q{);
+	SELECT length(} . sql_string($large_query_text) . q{);
+	});
+
+	if ($ok)
+	{
+		my @compressed_files =
+		  aez_files($compressed_dir, "shared-compressed-$compression");
+		is(scalar(@compressed_files), 1,
+			"$compression shared compressed workload wrote one binary log");
+		my ($compressed_json, $compressed_stderr) =
+		  run_command([ $decoder, '--raw', '--format', 'json', @compressed_files ]);
+		is($compressed_stderr, '',
+			"$compression shared compressed raw decoder stderr is empty");
+		like($compressed_json, qr/"Compression": "\Q$compression\E"/,
+			"$compression shared compressed binary log decodes");
+	}
+	else
+	{
+		note("$compression compression unavailable, decode coverage skipped: $stderr");
+	}
+}
 
 mkdir $retention_dir;
 append_to_file("$retention_dir/otherprefix-keep.aez", "keep");
