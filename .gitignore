@@ -4,6 +4,7 @@
 /tmp_check/
 
 # Build outputs
+/auto_explain_z_dump
 __pycache__/
 *.a
 *.bc

@@ -1,5 +1,3 @@
-# Copyright (c) 2026, PostgreSQL Global Development Group
-
 # Strict decoder equivalence coverage for auto_explain_z.
 #
 # By default this test always verifies that every planned node shape in the

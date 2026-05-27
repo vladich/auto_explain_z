@@ -375,7 +375,10 @@ def get_sharedir(pg_config):
 
 
 def extension_root(script):
-    return Path(script).resolve().parent
+    path = Path(script).resolve()
+    if path.parent.name == "bench":
+        return path.parent.parent
+    return path.parent
 
 
 def postgres_source_root(script, configured_root):
@@ -386,8 +389,12 @@ def postgres_source_root(script, configured_root):
         return root
 
     path = Path(script).resolve()
-    if path.parent.name == "auto_explain_z" and path.parent.parent.name == "contrib":
-        return path.parent.parent.parent
+    if path.parent.name == "bench":
+        path = path.parent.parent
+    else:
+        path = path.parent
+    if path.name == "auto_explain_z" and path.parent.name == "contrib":
+        return path.parent.parent
     return None
 
 

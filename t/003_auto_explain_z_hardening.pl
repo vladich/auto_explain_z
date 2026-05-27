@@ -1,5 +1,3 @@
-# Copyright (c) 2026, PostgreSQL Global Development Group
-
 use strict;
 use warnings FATAL => 'all';
 
@@ -202,6 +200,15 @@ ok(scalar(@good_files) == 1, 'single uncompressed source file created');
 my $good_json = decode_pg_json_files(@good_files);
 like($good_json, qr/"Node Type": "Aggregate"/,
 	'known-good uncompressed file decodes before corruption checks');
+my ($good_pglog, $good_pglog_stderr) =
+  run_command([ $decoder, '--postgres-log',
+	  '--log-line-prefix', 'pid=%p user=%u db=%d qid=%Q ',
+	  '--log-timezone', 'UTC', @good_files ]);
+is($good_pglog_stderr, '', 'postgres-log decoder stderr is empty');
+like(
+	$good_pglog,
+	qr/^pid=\d+ user=\S+ db=postgres qid=-?\d+ LOG:  duration: \d+\.\d{3} ms  plan:\n\tQuery Text: SELECT count\(\*\) FROM aez_harden/m,
+	'postgres-log decoder uses offline PostgreSQL log_line_prefix and auto_explain message shape');
 my $good_raw = decode_raw_json_dir($good_dir);
 for my $record (@$good_raw)
 {

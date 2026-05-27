@@ -33,9 +33,10 @@ serialized data with a file-level compression setting.
 - PostgreSQL built with `--with-lz4` to use `auto_explain_z.compression = lz4`.
 - PostgreSQL built with `--with-zstd` to use
   `auto_explain_z.compression = zstd`.
-- Python 3 for `auto_explain_z_dump` and benchmark scripts.
-- For decoding compressed files, either the matching Python module or a command
-  line decompressor must be available for the selected compression method.
+- Python 3 for the benchmark scripts under `bench/`.
+- The native `auto_explain_z_dump` decoder is built by `make`. Decoding
+  compressed files requires building against a PostgreSQL installation with
+  the corresponding `--with-lz4` or `--with-zstd` support.
 
 ## Installation
 
@@ -164,6 +165,32 @@ auto_explain_z_dump --format yaml /path/to/file.aez
 auto_explain_z_dump --format xml  /path/to/file.aez
 ```
 
+To reconstruct PostgreSQL `auto_explain`-style log records, use
+`--postgres-log`. The decoder stays fully offline. By default it uses
+PostgreSQL's default `log_line_prefix` value, `%m [%p] `, with `GMT` timestamps.
+Pass the same log-formatting values used by the source server when you need the
+reconstructed records to match that server's logs:
+
+```sh
+auto_explain_z_dump --postgres-log \
+  --log-line-prefix '%m [%p] ' \
+  --log-timezone 'America/Los_Angeles' \
+  /path/to/file.aez
+```
+
+Use `--log-error-verbosity verbose` if the source server logged verbose stderr
+records with SQLSTATE after the severity.
+
+`--format` still controls the plan payload format inside the reconstructed log
+message:
+
+```sh
+auto_explain_z_dump --postgres-log --format json \
+  --log-line-prefix '%m [%p] ' \
+  --log-timezone 'America/Los_Angeles' \
+  /path/to/file.aez
+```
+
 Use `--raw` to inspect AEZ record headers, log context, template metadata, and
 other diagnostic fields:
 
@@ -263,7 +290,7 @@ The current benchmark matrix compares PostgreSQL with no plan logging,
 Command shape used for the latest local run shown below:
 
 ```sh
-auto_explain_z_bench_all_modes \
+bench/auto_explain_z_bench_all_modes \
   --scale 5 --clients 8 --jobs 4 \
   --duration 60 --warmup 30 \
   --prewarm --reset-between-scenarios --burnin-baseline \
@@ -303,7 +330,7 @@ For production decisions, run longer tests with explicit prewarming and
 multiple iterations:
 
 ```sh
-auto_explain_z_bench_all_modes \
+bench/auto_explain_z_bench_all_modes \
   --scale 50 --clients 32 --jobs 16 \
   --duration 60 --warmup 30 \
   --prewarm --reset-between-scenarios --burnin-baseline \
@@ -321,14 +348,14 @@ once.
 Other benchmark entry points isolate specific axes:
 
 ```sh
-auto_explain_z_bench_templates
-auto_explain_z_bench_profiles
-auto_explain_z_bench_compression
-auto_explain_z_bench_shapes
-auto_explain_z_bench_formats
+bench/auto_explain_z_bench_templates
+bench/auto_explain_z_bench_profiles
+bench/auto_explain_z_bench_compression
+bench/auto_explain_z_bench_shapes
+bench/auto_explain_z_bench_formats
 ```
 
-Each accepts the common `auto_explain_z_bench` options for scale, clients,
+Each accepts the common `bench/auto_explain_z_bench` options for scale, clients,
 duration, warmup, prewarm, reset-between-scenarios, burnin-baseline,
 iterations, server paths, `pg_config`, and JSON output.
 
@@ -336,7 +363,7 @@ iterations, server paths, `pg_config`, and JSON output.
 
 The benchmark matrix uses the following measured transaction scripts. The
 first three are PostgreSQL `pgbench` built-ins; the remaining scripts are
-defined by `auto_explain_z_bench`.
+defined by `bench/auto_explain_z_bench`.
 
 `select-only`:
 

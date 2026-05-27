@@ -12,15 +12,7 @@ endif
 
 PGFILEDESC = "auto_explain_z - binary compressed execution plan logger"
 
-SCRIPTS = \
-	auto_explain_z_bench \
-	auto_explain_z_bench_all_modes \
-	auto_explain_z_bench_compression \
-	auto_explain_z_bench_formats \
-	auto_explain_z_bench_profiles \
-	auto_explain_z_bench_shapes \
-	auto_explain_z_bench_templates \
-	auto_explain_z_dump
+AEZ_DUMP = auto_explain_z_dump
 
 EXTENSION = auto_explain_z
 DATA = auto_explain_z--1.0.sql
@@ -29,6 +21,7 @@ SHLIB_LINK += $(filter -llz4 -lzstd, $(LIBS))
 
 TAP_TESTS = 1
 EXTRA_CLEAN = __pycache__ log results \
+	$(AEZ_DUMP) $(AEZ_DUMP).o $(AEZ_DUMP).bc \
 	$(addsuffix $(DLSUFFIX), $(AEZ_TEST_MODULES)) \
 	$(addsuffix .o, $(AEZ_TEST_MODULES)) \
 	$(addsuffix .bc, $(AEZ_TEST_MODULES))
@@ -36,6 +29,20 @@ EXTRA_CLEAN = __pycache__ log results \
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+all: $(AEZ_DUMP)
+
+$(AEZ_DUMP): $(AEZ_DUMP).o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+
+install: install-aez-dump
+install-aez-dump: $(AEZ_DUMP) installdirs
+	$(MKDIR_P) '$(DESTDIR)$(bindir)'
+	$(INSTALL_PROGRAM) $(AEZ_DUMP)$(X) '$(DESTDIR)$(bindir)/'
+
+uninstall: uninstall-aez-dump
+uninstall-aez-dump:
+	rm -f '$(DESTDIR)$(bindir)/$(AEZ_DUMP)$(X)'
 
 PG_TEST_PERL_DIR ?= $(firstword $(wildcard $(top_srcdir)/src/test/perl $(top_builddir)/src/test/perl ../postgres/src/test/perl ../postgres-*/src/test/perl))
 TAP_PROVE ?= prove
