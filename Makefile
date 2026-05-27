@@ -4,7 +4,11 @@ MODULE_big = auto_explain_z
 OBJS = \
 	$(WIN32RES) \
 	auto_explain_z.o
-MODULES = auto_explain_z_testscan
+
+AEZ_TEST_MODULES = auto_explain_z_testscan
+ifeq ($(AEZ_BUILD_TEST_MODULES),1)
+MODULES = $(AEZ_TEST_MODULES)
+endif
 
 PGFILEDESC = "auto_explain_z - binary compressed execution plan logger"
 
@@ -24,7 +28,10 @@ DATA = auto_explain_z--1.0.sql
 SHLIB_LINK += $(filter -llz4 -lzstd, $(LIBS))
 
 TAP_TESTS = 1
-EXTRA_CLEAN = __pycache__ log results
+EXTRA_CLEAN = __pycache__ log results \
+	$(addsuffix $(DLSUFFIX), $(AEZ_TEST_MODULES)) \
+	$(addsuffix .o, $(AEZ_TEST_MODULES)) \
+	$(addsuffix .bc, $(AEZ_TEST_MODULES))
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -35,8 +42,11 @@ TAP_PROVE ?= prove
 TAP_PERL5LIB ?= $(shell perl -MConfig -e 'print join(":", grep { -d $$_ } ("$$ENV{HOME}/perl5/lib/perl5", "$$ENV{HOME}/perl5/lib/perl5/$$Config{archname}"))')
 TAP_ENV ?=
 
-.PHONY: tapcheck fulltapcheck
-tapcheck: all
+.PHONY: aez-test-modules tapcheck fulltapcheck
+aez-test-modules:
+	$(MAKE) AEZ_BUILD_TEST_MODULES=1 $(addsuffix $(DLSUFFIX), $(AEZ_TEST_MODULES))
+
+tapcheck: all aez-test-modules
 	@if test -z "$(PG_TEST_PERL_DIR)"; then \
 		echo "PG_TEST_PERL_DIR not found; set PG_TEST_PERL_DIR=/path/to/postgresql/src/test/perl"; \
 		exit 2; \
