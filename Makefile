@@ -50,12 +50,12 @@ ifneq (,$(findstring --with-zstd,$(AEZ_PG_CONFIGURE)))
 AEZ_COMPRESSION_LIBS_RAW += -lzstd
 endif
 ifeq (,$(filter -llz4,$(AEZ_COMPRESSION_LIBS_RAW)))
-ifneq (,$(shell test -f '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && grep -q '^#define USE_LZ4 1' '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && echo yes))
+ifneq (,$(shell test -f '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && grep -q '^\#define USE_LZ4 1' '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && echo yes))
 AEZ_COMPRESSION_LIBS_RAW += -llz4
 endif
 endif
 ifeq (,$(filter -lzstd,$(AEZ_COMPRESSION_LIBS_RAW)))
-ifneq (,$(shell test -f '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && grep -q '^#define USE_ZSTD 1' '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && echo yes))
+ifneq (,$(shell test -f '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && grep -q '^\#define USE_ZSTD 1' '$(AEZ_INCLUDEDIR_SERVER)/pg_config.h' && echo yes))
 AEZ_COMPRESSION_LIBS_RAW += -lzstd
 endif
 endif
