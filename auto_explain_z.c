@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "auto_explain_z_format.h"
+
 #ifdef USE_LZ4
 #include <lz4.h>
 #include <lz4frame.h>
@@ -28,10 +30,16 @@
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "commands/dbcommands.h"
+#ifdef AEZ_HAVE_EXPLAIN_SPLIT_HEADERS
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#else
+#include "commands/explain.h"
+#endif
 #include "common/hashfn.h"
+#if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
+#endif
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "fmgr.h"
@@ -68,18 +76,41 @@
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
 
+#if PG_VERSION_NUM < 180000
+static inline uint64
+aez_murmurhash64(uint64 data)
+{
+	uint64		h = data;
+
+	h ^= h >> 33;
+	h *= UINT64CONST(0xff51afd7ed558ccd);
+	h ^= h >> 33;
+	h *= UINT64CONST(0xc4ceb9fe1a85ec53);
+	h ^= h >> 33;
+
+	return h;
+}
+#define murmurhash64(data) aez_murmurhash64(data)
+#endif
+
+#ifdef PG_MODULE_MAGIC_EXT
 PG_MODULE_MAGIC_EXT(
-						.name = "auto_explain_z",
-						.version = PG_VERSION
+					.name = "auto_explain_z",
+					.version = PG_VERSION
 );
+#else
+PG_MODULE_MAGIC;
+#endif
 
 PG_FUNCTION_INFO_V1(auto_explain_z_rotate_logfile);
 
 Datum		auto_explain_z_rotate_logfile(PG_FUNCTION_ARGS);
 
 #define AEZ_FILE_MAGIC			((uint32) 0x315a4541)	/* "AEZ1" */
-#define AEZ_FORMAT_VERSION		13
+#define AEZ_FORMAT_VERSION		14
 #define AEZ_FILE_HEADER_LEN		40
+#define AEZ_FILE_FLAG_WAL_BUFFERS_FULL	0x0001
+#define AEZ_FILE_FLAG_ACTUAL_ROWS_2_DECIMALS	0x0002
 #define AEZ_BYTES_TO_KILOBYTES(b) (((b) + 1023) / 1024)
 #define AEZ_DEFAULT_PENDING_BUFFER_SIZE_KB 1024
 #define AEZ_COMPRESSION_WORK_BUFFER_SIZE (64 * 1024)
@@ -403,7 +434,9 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static planner_hook_type prev_planner = NULL;
+#if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Shared template admission state, initialized only under shared_preload_libraries. */
@@ -464,7 +497,11 @@ static size_t aez_zstd_out_size = 0;
 static void aez_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void aez_ExecutorRun(QueryDesc *queryDesc,
 							ScanDirection direction,
-							uint64 count);
+							uint64 count
+#if PG_VERSION_NUM < 180000
+							, bool execute_once
+#endif
+);
 static void aez_ExecutorFinish(QueryDesc *queryDesc);
 static void aez_ExecutorEnd(QueryDesc *queryDesc);
 static PlannedStmt *aez_planner(Query *parse, const char *query_string,
@@ -581,6 +618,18 @@ static uint64 aez_hash_bytes_value(uint64 hash, const void *data, Size len);
 static uint64 aez_hash_u32(uint64 hash, uint32 value);
 static uint64 aez_hash_u64(uint64 hash, uint64 value);
 static uint64 aez_hash_bool(uint64 hash, bool value);
+static double aez_sample_random(void);
+static bool aez_timestamp_difference_exceeds_seconds(TimestampTz start,
+													 TimestampTz stop,
+													 int seconds);
+static const char *aez_backend_type_for_log(void);
+static int64 aez_buffer_shared_read_time_us(BufferUsage *usage);
+static int64 aez_buffer_shared_write_time_us(BufferUsage *usage);
+static int64 aez_buffer_local_read_time_us(BufferUsage *usage);
+static int64 aez_buffer_local_write_time_us(BufferUsage *usage);
+static int64 aez_buffer_temp_read_time_us(BufferUsage *usage);
+static int64 aez_buffer_temp_write_time_us(BufferUsage *usage);
+static int64 aez_wal_buffers_full(WalUsage *usage);
 static int64 aez_explain_time_microseconds(double seconds);
 static void aez_reset_templates(void);
 static void aez_invalidate_context_cache(void);
@@ -602,6 +651,7 @@ static void aez_init_serialize_state(AezSerializeState *state,
 									 uint32 payload_flags);
 static void aez_init_deparse_state(AezSerializeState *state);
 static bool aez_plan_is_disabled(Plan *plan);
+static uint8 aez_plan_node_code(Plan *plan);
 static void aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 									PlanState *planstate,
 									AezPlanRelationship relationship,
@@ -680,6 +730,7 @@ static void aez_detail_modifytable_info(StringInfo details, int *detail_count,
 										ModifyTableState *mtstate,
 										List *ancestors,
 										bool dynamic_only);
+#ifdef AEZ_HAVE_MERGE_ACTION_LISTS
 static void aez_detail_merge_actions(StringInfo details, int *detail_count,
 									 AezSerializeState *state,
 									 ModifyTableState *mtstate,
@@ -691,6 +742,7 @@ static char *aez_deparse_merge_action(AezSerializeState *state,
 									  List *ancestors);
 static const char *aez_merge_match_name(MergeMatchKind matchKind);
 static const char *aez_command_name(CmdType commandType);
+#endif
 static void aez_serialize_node_details(StringInfo details, int *detail_count,
 									   AezSerializeState *state,
 									   PlanState *planstate,
@@ -1160,13 +1212,19 @@ _PG_init(void)
 
 	if (process_shared_preload_libraries_in_progress)
 	{
+#if PG_VERSION_NUM >= 150000
 		prev_shmem_request_hook = shmem_request_hook;
 		shmem_request_hook = aez_shmem_request;
+#else
+		aez_shmem_request();
+#endif
 		prev_shmem_startup_hook = shmem_startup_hook;
 		shmem_startup_hook = aez_shmem_startup;
 	}
 
+#if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("auto_explain_z");
+#endif
 
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = aez_ExecutorStart;
@@ -1183,8 +1241,10 @@ _PG_init(void)
 static void
 aez_shmem_request(void)
 {
+#if PG_VERSION_NUM >= 150000
 	if (prev_shmem_request_hook)
 		prev_shmem_request_hook();
+#endif
 
 	RequestAddinShmemSpace(aez_memsize());
 	RequestNamedLWLockTranche("auto_explain_z", 2);
@@ -1346,8 +1406,7 @@ aez_ExecutorStart(QueryDesc *queryDesc, int eflags)
 				current_query_sampled = false;
 			else
 				current_query_sampled =
-					(pg_prng_double(&pg_global_prng_state) <
-					 auto_explain_z_sample_rate);
+					(aez_sample_random() < auto_explain_z_sample_rate);
 		}
 		else
 			current_query_sampled = false;
@@ -1390,15 +1449,27 @@ aez_ExecutorStart(QueryDesc *queryDesc, int eflags)
 }
 
 static void
-aez_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+aez_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count
+#if PG_VERSION_NUM < 180000
+				, bool execute_once
+#endif
+)
 {
 	nesting_level++;
 	PG_TRY();
 	{
 		if (prev_ExecutorRun)
+#if PG_VERSION_NUM >= 180000
 			prev_ExecutorRun(queryDesc, direction, count);
+#else
+			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+#endif
 		else
+#if PG_VERSION_NUM >= 180000
 			standard_ExecutorRun(queryDesc, direction, count);
+#else
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+#endif
 	}
 	PG_FINALLY();
 	{
@@ -1598,8 +1669,8 @@ aez_file_age_exceeded(TimestampTz now)
 	if (auto_explain_z_log_rotation_age <= 0 || aez_file_opened_ts == 0)
 		return false;
 
-	return TimestampDifferenceExceedsSeconds(aez_file_opened_ts, now,
-											 auto_explain_z_log_rotation_age * 60);
+	return aez_timestamp_difference_exceeds_seconds(aez_file_opened_ts, now,
+													auto_explain_z_log_rotation_age * 60);
 }
 
 static bool
@@ -1998,7 +2069,7 @@ aez_append_log_context(StringInfo buf)
 	const char *remote_host = NULL;
 	const char *remote_port = NULL;
 	const char *appname = application_name;
-	const char *backend_type = get_backend_type_for_log();
+	const char *backend_type = aez_backend_type_for_log();
 	MemoryContext oldcxt;
 	uint8		backend_type_code;
 	uint8		database_oid_code;
@@ -2366,17 +2437,17 @@ aez_serialize_planning_buffers(StringInfo details, int *detail_count,
 	values[8] = psprintf(INT64_FORMAT, usage->temp_blks_read);
 	values[9] = psprintf(INT64_FORMAT, usage->temp_blks_written);
 	values[10] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->shared_blk_read_time));
+						  aez_buffer_shared_read_time_us(usage));
 	values[11] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->shared_blk_write_time));
+						  aez_buffer_shared_write_time_us(usage));
 	values[12] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->local_blk_read_time));
+						  aez_buffer_local_read_time_us(usage));
 	values[13] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->local_blk_write_time));
+						  aez_buffer_local_write_time_us(usage));
 	values[14] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->temp_blk_read_time));
+						  aez_buffer_temp_read_time_us(usage));
 	values[15] = psprintf(INT64_FORMAT,
-						   INSTR_TIME_GET_MICROSEC(usage->temp_blk_write_time));
+						  aez_buffer_temp_write_time_us(usage));
 
 	aez_detail_cstring_array(details, detail_count,
 							 AEZ_DETAIL_PLANNING_BUFFERS, 16, values);
@@ -2494,8 +2565,12 @@ aez_serialize_jit_summary(StringInfo details, int *detail_count,
 	flags = psprintf("%d", estate->es_jit_flags);
 	generation_us = psprintf(INT64_FORMAT,
 							 (int64) INSTR_TIME_GET_MICROSEC(ji.generation_counter));
+#if PG_VERSION_NUM >= 170000
 	deform_us = psprintf(INT64_FORMAT,
 						 (int64) INSTR_TIME_GET_MICROSEC(ji.deform_counter));
+#else
+	deform_us = "0";
+#endif
 	inlining_us = psprintf(INT64_FORMAT,
 						   (int64) INSTR_TIME_GET_MICROSEC(ji.inlining_counter));
 	optimization_us = psprintf(INT64_FORMAT,
@@ -2535,6 +2610,100 @@ aez_plan_shape_hash(AezSerializeState *state, PlanState *planstate,
 	return aez_hash_plan_shape_node(state, hash, planstate, relationship);
 }
 
+static uint8
+aez_plan_node_code(Plan *plan)
+{
+	switch (nodeTag(plan))
+	{
+		case T_Result:
+			return AEZ_PLAN_NODE_RESULT;
+		case T_ProjectSet:
+			return AEZ_PLAN_NODE_PROJECT_SET;
+		case T_ModifyTable:
+			return AEZ_PLAN_NODE_MODIFY_TABLE;
+		case T_Append:
+			return AEZ_PLAN_NODE_APPEND;
+		case T_MergeAppend:
+			return AEZ_PLAN_NODE_MERGE_APPEND;
+		case T_RecursiveUnion:
+			return AEZ_PLAN_NODE_RECURSIVE_UNION;
+		case T_BitmapAnd:
+			return AEZ_PLAN_NODE_BITMAP_AND;
+		case T_BitmapOr:
+			return AEZ_PLAN_NODE_BITMAP_OR;
+		case T_SeqScan:
+			return AEZ_PLAN_NODE_SEQ_SCAN;
+		case T_SampleScan:
+			return AEZ_PLAN_NODE_SAMPLE_SCAN;
+		case T_IndexScan:
+			return AEZ_PLAN_NODE_INDEX_SCAN;
+		case T_IndexOnlyScan:
+			return AEZ_PLAN_NODE_INDEX_ONLY_SCAN;
+		case T_BitmapIndexScan:
+			return AEZ_PLAN_NODE_BITMAP_INDEX_SCAN;
+		case T_BitmapHeapScan:
+			return AEZ_PLAN_NODE_BITMAP_HEAP_SCAN;
+		case T_TidScan:
+			return AEZ_PLAN_NODE_TID_SCAN;
+		case T_TidRangeScan:
+			return AEZ_PLAN_NODE_TID_RANGE_SCAN;
+		case T_SubqueryScan:
+			return AEZ_PLAN_NODE_SUBQUERY_SCAN;
+		case T_FunctionScan:
+			return AEZ_PLAN_NODE_FUNCTION_SCAN;
+		case T_ValuesScan:
+			return AEZ_PLAN_NODE_VALUES_SCAN;
+		case T_TableFuncScan:
+			return AEZ_PLAN_NODE_TABLE_FUNCTION_SCAN;
+		case T_CteScan:
+			return AEZ_PLAN_NODE_CTE_SCAN;
+		case T_NamedTuplestoreScan:
+			return AEZ_PLAN_NODE_NAMED_TUPLESTORE_SCAN;
+		case T_WorkTableScan:
+			return AEZ_PLAN_NODE_WORKTABLE_SCAN;
+		case T_ForeignScan:
+			return AEZ_PLAN_NODE_FOREIGN_SCAN;
+		case T_CustomScan:
+			return AEZ_PLAN_NODE_CUSTOM_SCAN;
+		case T_NestLoop:
+			return AEZ_PLAN_NODE_NESTED_LOOP;
+		case T_MergeJoin:
+			return AEZ_PLAN_NODE_MERGE_JOIN;
+		case T_HashJoin:
+			return AEZ_PLAN_NODE_HASH_JOIN;
+		case T_Material:
+			return AEZ_PLAN_NODE_MATERIALIZE;
+		case T_Memoize:
+			return AEZ_PLAN_NODE_MEMOIZE;
+		case T_Sort:
+			return AEZ_PLAN_NODE_SORT;
+		case T_IncrementalSort:
+			return AEZ_PLAN_NODE_INCREMENTAL_SORT;
+		case T_Group:
+			return AEZ_PLAN_NODE_GROUP;
+		case T_Agg:
+			return AEZ_PLAN_NODE_AGGREGATE;
+		case T_WindowAgg:
+			return AEZ_PLAN_NODE_WINDOW_AGG;
+		case T_Unique:
+			return AEZ_PLAN_NODE_UNIQUE;
+		case T_Gather:
+			return AEZ_PLAN_NODE_GATHER;
+		case T_GatherMerge:
+			return AEZ_PLAN_NODE_GATHER_MERGE;
+		case T_Hash:
+			return AEZ_PLAN_NODE_HASH;
+		case T_SetOp:
+			return AEZ_PLAN_NODE_SETOP;
+		case T_LockRows:
+			return AEZ_PLAN_NODE_LOCK_ROWS;
+		case T_Limit:
+			return AEZ_PLAN_NODE_LIMIT;
+		default:
+			return AEZ_PLAN_NODE_UNKNOWN;
+	}
+}
+
 static uint64
 aez_hash_plan_shape_node(AezSerializeState *state, uint64 hash,
 						 PlanState *planstate,
@@ -2544,7 +2713,7 @@ aez_hash_plan_shape_node(AezSerializeState *state, uint64 hash,
 	int			child_count;
 
 	hash = aez_hash_u32(hash, (uint32) relationship);
-	hash = aez_hash_u32(hash, (uint32) nodeTag(plan));
+	hash = aez_hash_u32(hash, (uint32) aez_plan_node_code(plan));
 	hash = aez_hash_bool(hash, plan->parallel_aware);
 	hash = aez_hash_bool(hash, plan->async_capable);
 	hash = aez_hash_plan_static_fields(state, hash, plan);
@@ -2657,7 +2826,9 @@ aez_hash_plan_shape_subplans(AezSerializeState *state, uint64 hash,
 static uint64
 aez_hash_plan_static_fields(AezSerializeState *state, uint64 hash, Plan *plan)
 {
+#if PG_VERSION_NUM >= 180000
 	hash = aez_hash_u32(hash, (uint32) plan->disabled_nodes);
+#endif
 
 	switch (nodeTag(plan))
 	{
@@ -2714,8 +2885,10 @@ aez_hash_plan_static_fields(AezSerializeState *state, uint64 hash, Plan *plan)
 										((ModifyTable *) plan)->returningLists);
 			hash = aez_hash_node_string(hash,
 										((ModifyTable *) plan)->withCheckOptionLists);
+#if PG_VERSION_NUM >= 150000
 			hash = aez_hash_node_string(hash,
 										((ModifyTable *) plan)->mergeActionLists);
+#endif
 			break;
 		case T_ForeignScan:
 			hash = aez_hash_u32(hash,
@@ -2839,8 +3012,10 @@ aez_hash_plan_static_fields(AezSerializeState *state, uint64 hash, Plan *plan)
 		case T_WindowAgg:
 			if (auto_explain_z_profile == AEZ_PROFILE_FULL)
 			{
+#if PG_VERSION_NUM >= 150000
 				hash = aez_hash_node_string(hash,
 											((WindowAgg *) plan)->runConditionOrig);
+#endif
 				hash = aez_hash_u32(hash,
 									(uint32) ((WindowAgg *) plan)->partNumCols);
 				hash = aez_hash_bytes_value(hash,
@@ -3003,6 +3178,116 @@ static uint64
 aez_hash_bool(uint64 hash, bool value)
 {
 	return aez_hash_u32(hash, value ? 1 : 0);
+}
+
+static double
+aez_sample_random(void)
+{
+#if PG_VERSION_NUM >= 150000
+	return pg_prng_double(&pg_global_prng_state);
+#else
+	static bool initialized = false;
+	static unsigned short seed[3];
+	TimestampTz now;
+
+	if (!initialized)
+	{
+		now = GetCurrentTimestamp();
+		seed[0] = (unsigned short) now;
+		seed[1] = (unsigned short) (now >> 16);
+		seed[2] = (unsigned short) MyProcPid;
+		initialized = true;
+	}
+
+	return pg_erand48(seed);
+#endif
+}
+
+static bool
+aez_timestamp_difference_exceeds_seconds(TimestampTz start, TimestampTz stop,
+										 int seconds)
+{
+	return TimestampDifferenceExceeds(start, stop, seconds * 1000);
+}
+
+static const char *
+aez_backend_type_for_log(void)
+{
+#if PG_VERSION_NUM >= 180000
+	return get_backend_type_for_log();
+#else
+	return GetBackendTypeDesc(MyBackendType);
+#endif
+}
+
+static int64
+aez_buffer_shared_read_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 170000
+	return INSTR_TIME_GET_MICROSEC(usage->shared_blk_read_time);
+#else
+	return INSTR_TIME_GET_MICROSEC(usage->blk_read_time);
+#endif
+}
+
+static int64
+aez_buffer_shared_write_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 170000
+	return INSTR_TIME_GET_MICROSEC(usage->shared_blk_write_time);
+#else
+	return INSTR_TIME_GET_MICROSEC(usage->blk_write_time);
+#endif
+}
+
+static int64
+aez_buffer_local_read_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 170000
+	return INSTR_TIME_GET_MICROSEC(usage->local_blk_read_time);
+#else
+	return 0;
+#endif
+}
+
+static int64
+aez_buffer_local_write_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 170000
+	return INSTR_TIME_GET_MICROSEC(usage->local_blk_write_time);
+#else
+	return 0;
+#endif
+}
+
+static int64
+aez_buffer_temp_read_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 150000
+	return INSTR_TIME_GET_MICROSEC(usage->temp_blk_read_time);
+#else
+	return 0;
+#endif
+}
+
+static int64
+aez_buffer_temp_write_time_us(BufferUsage *usage)
+{
+#if PG_VERSION_NUM >= 150000
+	return INSTR_TIME_GET_MICROSEC(usage->temp_blk_write_time);
+#else
+	return 0;
+#endif
+}
+
+static int64
+aez_wal_buffers_full(WalUsage *usage)
+{
+#ifdef AEZ_HAVE_WAL_BUFFERS_FULL
+	return usage->wal_buffers_full;
+#else
+	return 0;
+#endif
 }
 
 static int64
@@ -3513,8 +3798,8 @@ aez_open_file_locked(uint64 needed, TimestampTz now, bool *created_new_file)
 	time_rotation = aez_shared->file_active &&
 		auto_explain_z_log_rotation_age > 0 &&
 		aez_shared->file_opened_ts != 0 &&
-		TimestampDifferenceExceedsSeconds(aez_shared->file_opened_ts, now,
-										  auto_explain_z_log_rotation_age * 60);
+		aez_timestamp_difference_exceeds_seconds(aez_shared->file_opened_ts, now,
+												 auto_explain_z_log_rotation_age * 60);
 	max_bytes = (uint64) auto_explain_z_log_rotation_size * 1024;
 	size_rotation = aez_shared->file_active &&
 		max_bytes > 0 &&
@@ -4343,11 +4628,20 @@ aez_has_suffix(const char *name, const char *suffix)
 static void
 aez_build_file_header(StringInfo buf)
 {
+	uint16		file_flags = 0;
+
+#ifdef AEZ_HAVE_WAL_BUFFERS_FULL
+	file_flags |= AEZ_FILE_FLAG_WAL_BUFFERS_FULL;
+#endif
+#ifdef AEZ_HAVE_EXPLAIN_SPLIT_HEADERS
+	file_flags |= AEZ_FILE_FLAG_ACTUAL_ROWS_2_DECIMALS;
+#endif
+
 	aez_put_u32(buf, AEZ_FILE_MAGIC);
 	aez_put_u16(buf, AEZ_FORMAT_VERSION);
 	aez_put_u16(buf, AEZ_FILE_HEADER_LEN);
 	aez_put_u16(buf, (uint16) aez_file_compression);
-	aez_put_u16(buf, 0);		/* file flags */
+	aez_put_u16(buf, file_flags);
 	aez_put_u32(buf, PG_VERSION_NUM);
 	aez_put_i64(buf, PgStartTime);
 	aez_put_i64(buf, (int64) timestamptz_to_time_t(PgStartTime));
@@ -4464,7 +4758,11 @@ aez_prescan_node(PlanState *planstate, Bitmapset **rels_used)
 			break;
 		case T_ForeignScan:
 			*rels_used = bms_add_members(*rels_used,
+#if PG_VERSION_NUM >= 160000
 										 ((ForeignScan *) plan)->fs_base_relids);
+#else
+										 ((ForeignScan *) plan)->fs_relids);
+#endif
 			break;
 		case T_CustomScan:
 			*rels_used = bms_add_members(*rels_used,
@@ -4499,7 +4797,9 @@ static void
 aez_init_serialize_state(AezSerializeState *state, QueryDesc *queryDesc,
 						 uint32 payload_flags)
 {
+#if PG_VERSION_NUM >= 180000
 	ListCell   *lc;
+#endif
 
 	memset(state, 0, sizeof(*state));
 	state->queryDesc = queryDesc;
@@ -4507,6 +4807,7 @@ aez_init_serialize_state(AezSerializeState *state, QueryDesc *queryDesc,
 	state->verbose = (payload_flags & AEZ_QUERY_FLAG_VERBOSE) != 0;
 	state->analyze = (payload_flags & AEZ_QUERY_FLAG_ANALYZE) != 0;
 	state->rtable_size = list_length(state->rtable);
+#if PG_VERSION_NUM >= 180000
 	foreach(lc, state->rtable)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
@@ -4517,6 +4818,7 @@ aez_init_serialize_state(AezSerializeState *state, QueryDesc *queryDesc,
 			break;
 		}
 	}
+#endif
 }
 
 static void
@@ -4538,6 +4840,9 @@ aez_init_deparse_state(AezSerializeState *state)
 static bool
 aez_plan_is_disabled(Plan *plan)
 {
+#if PG_VERSION_NUM < 180000
+	return false;
+#else
 	int			child_disabled_nodes = 0;
 
 	if (plan->disabled_nodes == 0)
@@ -4578,6 +4883,7 @@ aez_plan_is_disabled(Plan *plan)
 	}
 
 	return plan->disabled_nodes > child_disabled_nodes;
+#endif
 }
 
 static void
@@ -4672,7 +4978,7 @@ aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 		(child_count_code << 6);
 
 	aez_put_u8(buf, (uint8) relationship);
-	aez_put_u16(buf, (uint16) nodeTag(plan));
+	aez_put_u8(buf, aez_plan_node_code(plan));
 	aez_put_u16(buf, node_flags);
 	aez_put_u8(buf, extra_kind);
 	aez_put_u8(buf, size_flags);
@@ -4708,12 +5014,12 @@ aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 		aez_put_i64(buf, usage->local_blks_written);
 		aez_put_i64(buf, usage->temp_blks_read);
 		aez_put_i64(buf, usage->temp_blks_written);
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->shared_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->shared_blk_write_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->local_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->local_blk_write_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->temp_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->temp_blk_write_time));
+		aez_put_i64(buf, aez_buffer_shared_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_shared_write_time_us(usage));
+		aez_put_i64(buf, aez_buffer_local_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_local_write_time_us(usage));
+		aez_put_i64(buf, aez_buffer_temp_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_temp_write_time_us(usage));
 	}
 
 	if (node_flags & AEZ_NODE_FLAG_HAS_WAL)
@@ -4723,7 +5029,7 @@ aez_serialize_plan_node(StringInfo buf, AezSerializeState *state,
 		aez_put_i64(buf, usage->wal_records);
 		aez_put_i64(buf, usage->wal_fpi);
 		aez_put_u64(buf, usage->wal_bytes);
-		aez_put_i64(buf, usage->wal_buffers_full);
+		aez_put_i64(buf, aez_wal_buffers_full(usage));
 	}
 
 	aez_append_plan_identity(buf, state, plan);
@@ -5059,7 +5365,7 @@ aez_serialize_plan_metrics(StringInfo buf, AezSerializeState *state,
 	child_count_code = aez_uint_size_code((uint64) child_count);
 	size_flags = width_code | (child_count_code << 2);
 
-	aez_put_u16(buf, (uint16) nodeTag(plan));
+	aez_put_u8(buf, aez_plan_node_code(plan));
 	aez_put_u16(buf, node_flags);
 	aez_put_u8(buf, size_flags);
 	aez_put_double(buf, plan->startup_cost);
@@ -5092,12 +5398,12 @@ aez_serialize_plan_metrics(StringInfo buf, AezSerializeState *state,
 		aez_put_i64(buf, usage->local_blks_written);
 		aez_put_i64(buf, usage->temp_blks_read);
 		aez_put_i64(buf, usage->temp_blks_written);
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->shared_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->shared_blk_write_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->local_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->local_blk_write_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->temp_blk_read_time));
-		aez_put_i64(buf, INSTR_TIME_GET_MICROSEC(usage->temp_blk_write_time));
+		aez_put_i64(buf, aez_buffer_shared_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_shared_write_time_us(usage));
+		aez_put_i64(buf, aez_buffer_local_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_local_write_time_us(usage));
+		aez_put_i64(buf, aez_buffer_temp_read_time_us(usage));
+		aez_put_i64(buf, aez_buffer_temp_write_time_us(usage));
 	}
 
 	if (node_flags & AEZ_NODE_FLAG_HAS_WAL)
@@ -5107,7 +5413,7 @@ aez_serialize_plan_metrics(StringInfo buf, AezSerializeState *state,
 		aez_put_i64(buf, usage->wal_records);
 		aez_put_i64(buf, usage->wal_fpi);
 		aez_put_u64(buf, usage->wal_bytes);
-		aez_put_i64(buf, usage->wal_buffers_full);
+		aez_put_i64(buf, aez_wal_buffers_full(usage));
 	}
 
 	initStringInfo(&details);
@@ -5409,6 +5715,7 @@ aez_serialize_runtime_node_details(StringInfo details, int *detail_count,
 										((TableFuncScanState *) planstate)->tupstore);
 			break;
 		case T_RecursiveUnion:
+#ifdef AEZ_HAVE_TUPLESTORE_STATS
 			if (state->analyze)
 			{
 				RecursiveUnionState *rstate = (RecursiveUnionState *) planstate;
@@ -5433,6 +5740,7 @@ aez_serialize_runtime_node_details(StringInfo details, int *detail_count,
 				aez_detail_cstring_array(details, detail_count,
 										 AEZ_DETAIL_STORAGE_INFO, 2, values);
 			}
+#endif
 			break;
 		case T_Memoize:
 			aez_detail_memoize_info(details, detail_count, state,
@@ -5551,6 +5859,7 @@ aez_detail_scan_target(StringInfo details, int *detail_count,
 
 				if (rte->rtekind != RTE_TABLEFUNC || tablefunc == NULL)
 					return;
+#if PG_VERSION_NUM >= 170000
 				switch (tablefunc->functype)
 				{
 					case TFT_XMLTABLE:
@@ -5563,6 +5872,9 @@ aez_detail_scan_target(StringInfo details, int *detail_count,
 						elog(ERROR, "invalid TableFunc type %d",
 							 (int) tablefunc->functype);
 				}
+#else
+				objectname = "xmltable";
+#endif
 				objectcode = AEZ_DETAIL_TABLE_FUNCTION_NAME;
 			}
 			break;
@@ -5685,6 +5997,9 @@ aez_detail_window_def(StringInfo details, int *detail_count,
 					  WindowAggState *planstate,
 					  List *ancestors)
 {
+#ifndef AEZ_HAVE_WINDOW_AGG_WINNAME
+	return;
+#else
 	WindowAgg  *wagg = (WindowAgg *) planstate->ss.ps.plan;
 	StringInfoData wbuf;
 	bool		needspace = false;
@@ -5734,6 +6049,7 @@ aez_detail_window_def(StringInfo details, int *detail_count,
 	}
 	appendStringInfoChar(&wbuf, ')');
 	aez_detail_string(details, detail_count, AEZ_DETAIL_WINDOW, wbuf.data);
+#endif
 }
 
 static void
@@ -5983,6 +6299,9 @@ static void
 aez_detail_storage_info(StringInfo details, int *detail_count,
 						AezDetailCode code, Tuplestorestate *tupstore)
 {
+#ifndef AEZ_HAVE_TUPLESTORE_STATS
+	return;
+#else
 	char	   *storage_type;
 	int64		space_used;
 	char	   *space_kb;
@@ -5997,6 +6316,7 @@ aez_detail_storage_info(StringInfo details, int *detail_count,
 	values[0] = storage_type;
 	values[1] = space_kb;
 	aez_detail_cstring_array(details, detail_count, code, 2, values);
+#endif
 }
 
 static void
@@ -6183,6 +6503,9 @@ aez_detail_index_searches(StringInfo details, int *detail_count,
 						  AezSerializeState *state,
 						  PlanState *planstate)
 {
+#ifndef AEZ_HAVE_INDEX_SCAN_INSTRUMENTATION
+	return;
+#else
 	Plan	   *plan = planstate->plan;
 	SharedIndexScanInstrumentation *sharedInfo = NULL;
 	uint64		nsearches = 0;
@@ -6216,6 +6539,7 @@ aez_detail_index_searches(StringInfo details, int *detail_count,
 
 	aez_detail_u64(details, detail_count, AEZ_DETAIL_INDEX_SEARCHES,
 				   nsearches);
+#endif
 }
 
 static void
@@ -6232,14 +6556,20 @@ aez_detail_bitmap_heap_blocks(StringInfo details, int *detail_count,
 		return;
 
 	worker = psprintf("%d", -1);
+#if PG_VERSION_NUM >= 180000
 	exact = psprintf(UINT64_FORMAT, planstate->stats.exact_pages);
 	lossy = psprintf(UINT64_FORMAT, planstate->stats.lossy_pages);
+#else
+	exact = psprintf(UINT64_FORMAT, (uint64) planstate->exact_pages);
+	lossy = psprintf(UINT64_FORMAT, (uint64) planstate->lossy_pages);
+#endif
 	values[0] = worker;
 	values[1] = exact;
 	values[2] = lossy;
 	aez_detail_cstring_array(details, detail_count,
 							 AEZ_DETAIL_BITMAP_HEAP_BLOCKS, 3, values);
 
+#if PG_VERSION_NUM >= 180000
 	if (planstate->pstate != NULL)
 	{
 		for (int n = 0; n < planstate->sinstrument->num_workers; n++)
@@ -6260,6 +6590,7 @@ aez_detail_bitmap_heap_blocks(StringInfo details, int *detail_count,
 									 AEZ_DETAIL_BITMAP_HEAP_BLOCKS, 3, values);
 		}
 	}
+#endif
 }
 
 static void
@@ -6300,11 +6631,15 @@ aez_detail_modifytable_info(StringInfo details, int *detail_count,
 											 1);
 		}
 	}
+#if PG_VERSION_NUM >= 150000
 	else if (!dynamic_only && node->operation == CMD_MERGE)
 	{
+#ifdef AEZ_HAVE_MERGE_ACTION_LISTS
 		aez_detail_merge_actions(details, detail_count, state, mtstate,
 								 ancestors);
+#endif
 	}
+#endif
 
 	if (!state->analyze || !mtstate->ps.instrument)
 		return;
@@ -6329,6 +6664,7 @@ aez_detail_modifytable_info(StringInfo details, int *detail_count,
 		aez_detail_cstring_array(details, detail_count,
 								 AEZ_DETAIL_CONFLICT_TUPLES, 2, values);
 	}
+#if PG_VERSION_NUM >= 150000
 	else if (node->operation == CMD_MERGE && outerPlanState(mtstate))
 	{
 		const char *values[4];
@@ -6359,8 +6695,10 @@ aez_detail_modifytable_info(StringInfo details, int *detail_count,
 		aez_detail_cstring_array(details, detail_count,
 								 AEZ_DETAIL_MERGE_TUPLES, 4, values);
 	}
+#endif
 }
 
+#ifdef AEZ_HAVE_MERGE_ACTION_LISTS
 static void
 aez_detail_merge_actions(StringInfo details, int *detail_count,
 						 AezSerializeState *state,
@@ -6538,6 +6876,7 @@ aez_command_name(CmdType commandType)
 			return "UNKNOWN";
 	}
 }
+#endif
 
 static void
 aez_serialize_node_details(StringInfo details, int *detail_count,
@@ -6900,11 +7239,13 @@ aez_serialize_node_details(StringInfo details, int *detail_count,
 			aez_detail_window_def(details, detail_count, state,
 								  (WindowAggState *) planstate,
 								  ancestors);
+#if PG_VERSION_NUM >= 150000
 			aez_detail_qual(details, detail_count, state, planstate,
 							ancestors,
 							((WindowAgg *) plan)->runConditionOrig,
 							AEZ_DETAIL_RUN_CONDITION,
 							state->rtable_size > 1 || state->verbose);
+#endif
 			aez_detail_qual(details, detail_count, state, planstate,
 							ancestors, plan->qual, AEZ_DETAIL_FILTER,
 							state->rtable_size > 1 || state->verbose);
@@ -7219,7 +7560,9 @@ aez_new_text_explain_state(AezSerializeState *state)
 	es->deparse_cxt = state->deparse_cxt;
 	es->printed_subplans = NULL;
 	es->hide_workers = false;
+#if PG_VERSION_NUM >= 180000
 	es->rtable_size = state->rtable_size;
+#endif
 
 	return es;
 }
@@ -7265,7 +7608,11 @@ aez_capture_foreignmodify_explain(ExplainState *es, ModifyTableState *mtstate)
 		{
 			Relation	rel = resultRelInfo->ri_RelationDesc;
 
+#ifdef AEZ_HAVE_EXPLAIN_SPLIT_HEADERS
 			ExplainIndentText(es);
+#else
+			appendStringInfoSpaces(es->str, es->indent * 2);
+#endif
 			if (rel)
 				appendStringInfo(es->str, "Foreign Modify on %s:\n",
 								 quote_identifier(RelationGetRelationName(rel)));

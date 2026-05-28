@@ -10,14 +10,16 @@ use strict;
 use warnings FATAL => 'all';
 
 use Cwd qw(abs_path);
-use FindBin;
 use JSON::PP;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $decoder = "$FindBin::Bin/../auto_explain_z_dump";
+my $decoder = $ENV{AEZ_DUMP} // '';
+plan skip_all => "AEZ_DUMP not set" if $decoder eq '';
 plan skip_all => "auto_explain_z_dump not found" unless -x $decoder;
+my $module_dir = $ENV{AEZ_MODULE_DIR} // '';
+plan skip_all => "AEZ_MODULE_DIR not set" if $module_dir eq '';
 
 my $full_matrix = $ENV{AEZ_DECODER_EQUIV_FULL_MATRIX} ? 1 : 0;
 
@@ -26,6 +28,17 @@ sub sql_string
 	my ($value) = @_;
 	$value =~ s/'/''/g;
 	return "'$value'";
+}
+
+sub installed_extension_available
+{
+	my ($name) = @_;
+	my $pg_config = $ENV{PG_CONFIG} // '';
+
+	return 0 if $pg_config eq '';
+	my ($sharedir, $stderr) = run_command([ $pg_config, '--sharedir' ]);
+	chomp($sharedir);
+	return -f "$sharedir/extension/$name.control";
 }
 
 sub slurp_files
@@ -172,7 +185,7 @@ my $node = PostgreSQL::Test::Cluster->new('decoder_equivalence');
 $node->init;
 
 my $data_dir = abs_path($node->data_dir);
-my $module_dir = "$FindBin::Bin/..";
+my $have_file_fdw = installed_extension_available('file_fdw');
 my $fdw_file = "$data_dir/aez_equiv_fdw.csv";
 
 $node->append_conf(
@@ -278,13 +291,16 @@ ANALYZE aez_parallel;
 ANALYZE aez_part;
 });
 
-$node->safe_psql(
-	'postgres',
-	"CREATE EXTENSION file_fdw;
+if ($have_file_fdw)
+{
+	$node->safe_psql(
+		'postgres',
+		"CREATE EXTENSION file_fdw;
 CREATE SERVER aez_file_srv FOREIGN DATA WRAPPER file_fdw;
 CREATE FOREIGN TABLE aez_fdw(id int, label text)
 SERVER aez_file_srv
 OPTIONS (filename " . sql_string($fdw_file) . ", format 'csv');");
+}
 
 my @node_cases = (
 	{
@@ -477,6 +493,10 @@ my @node_cases = (
 		sql => 'SELECT count(*) FROM aez_customscan;',
 	},
 );
+
+@node_cases = grep {
+	$have_file_fdw || $_->{name} ne 'foreign_scan'
+} @node_cases;
 
 my ($tf_ret, $tf_stdout, $tf_stderr) = $node->psql(
 	'postgres',

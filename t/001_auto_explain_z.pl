@@ -2,19 +2,42 @@ use strict;
 use warnings FATAL => 'all';
 
 use Cwd qw(abs_path);
-use FindBin;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $decoder = "$FindBin::Bin/../auto_explain_z_dump";
+my $decoder = $ENV{AEZ_DUMP} // '';
+plan skip_all => "AEZ_DUMP not set" if $decoder eq '';
 plan skip_all => "auto_explain_z_dump not found" unless -x $decoder;
+my $module_dir = $ENV{AEZ_MODULE_DIR} // '';
+plan skip_all => "AEZ_MODULE_DIR not set" if $module_dir eq '';
 
 sub sql_string
 {
 	my ($value) = @_;
 	$value =~ s/'/''/g;
 	return "'$value'";
+}
+
+sub installed_extension_available
+{
+	my ($name) = @_;
+	my $pg_config = $ENV{PG_CONFIG} // '';
+
+	return 0 if $pg_config eq '';
+	my ($sharedir, $stderr) = run_command([ $pg_config, '--sharedir' ]);
+	chomp($sharedir);
+	return -f "$sharedir/extension/$name.control";
+}
+
+sub pg_version_num
+{
+	my $pg_config = $ENV{PG_CONFIG} // '';
+
+	return 0 if $pg_config eq '';
+	my ($version, $stderr) = run_command([ $pg_config, '--version' ]);
+	return $1 * 10000 if $version =~ /PostgreSQL\s+(\d+)/;
+	return 0;
 }
 
 sub decode_dir_raw
@@ -78,7 +101,8 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 
 my $data_dir = abs_path($node->data_dir);
-my $module_dir = "$FindBin::Bin/..";
+my $have_file_fdw = installed_extension_available('file_fdw');
+my $pg_version_num = pg_version_num();
 my $fdw_file = "$data_dir/aez_fdw.csv";
 my $log_dir = "$data_dir/aez_full";
 my $template_dir = "$data_dir/aez_template";
@@ -203,13 +227,16 @@ ANALYZE aez_parallel;
 ANALYZE aez_part;
 });
 $node->safe_psql('postgres', 'VACUUM ANALYZE aez_t;');
-$node->safe_psql(
-	'postgres',
-	"CREATE EXTENSION file_fdw;
+if ($have_file_fdw)
+{
+	$node->safe_psql(
+		'postgres',
+		"CREATE EXTENSION file_fdw;
 CREATE SERVER aez_file_srv FOREIGN DATA WRAPPER file_fdw;
 CREATE FOREIGN TABLE aez_fdw(id int, label text)
 SERVER aez_file_srv
 OPTIONS (filename " . sql_string($fdw_file) . ", format 'csv');");
+}
 $node->safe_psql(
 	'postgres', q{
 SET enable_seqscan = off;
@@ -220,8 +247,8 @@ RESET enable_seqscan;
 my $json = decode_dir($log_dir, 'json');
 like($json, qr/"Query Text": "SELECT \* FROM aez_t WHERE id = 7;"/,
 	'query text decoded from binary log');
-like($json, qr/"Format Version": 13/,
-	'v13 binary log decoded');
+like($json, qr/"Format Version": 14/,
+	'v14 binary log decoded');
 like($json, qr/"Plan Identifier": \d+/,
 	'plan identifier decoded from binary log');
 like($json, qr/"Compression": "none"/,
@@ -475,13 +502,28 @@ INSERT INTO aez_mod VALUES (1, 'a')
 ON CONFLICT (id) DO UPDATE SET payload = excluded.payload;
 UPDATE aez_mod SET payload = 'b' WHERE id = 1;
 DELETE FROM aez_mod WHERE id = 1;
+INSERT INTO aez_transition_src SELECT g FROM generate_series(1, 3) g;
+});
+
+if ($pg_version_num >= 150000)
+{
+	$node->safe_psql(
+		'postgres',
+		"SET auto_explain_z.directory = " . sql_string($shape_dir) . q{;
+SET auto_explain_z.profile = full;
+SET auto_explain_z.template_cache = off;
+SET auto_explain_z.log_analyze = on;
+SET auto_explain_z.log_verbose = on;
+SET auto_explain_z.log_buffers = on;
+SET auto_explain_z.log_wal = on;
+SET auto_explain_z.log_timing = on;
 MERGE INTO aez_mod m
 USING (VALUES (2, 'm')) AS v(id, payload)
 ON m.id = v.id
 WHEN MATCHED THEN UPDATE SET payload = v.payload
 WHEN NOT MATCHED THEN INSERT VALUES (v.id, v.payload);
-INSERT INTO aez_transition_src SELECT g FROM generate_series(1, 3) g;
 });
+}
 
 my $tablefunc_available = 0;
 my ($tf_ret, $tf_stdout, $tf_stderr) = try_logged_query(
@@ -578,18 +620,25 @@ my $parallel_pg_json = decode_dir_pg($parallel_dir, 'json');
 like($parallel_pg_json, qr/"Parallel Aware": true/,
 	'parallel-aware child node decoded');
 
-$node->safe_psql(
-	'postgres',
-	"SET auto_explain_z.directory = " . sql_string($fdw_dir) . q{;
+if ($have_file_fdw)
+{
+	$node->safe_psql(
+		'postgres',
+		"SET auto_explain_z.directory = " . sql_string($fdw_dir) . q{;
 SET auto_explain_z.profile = full;
 SET auto_explain_z.template_cache = off;
 SELECT * FROM aez_fdw WHERE id > 1;
 });
 
-$json = decode_dir($fdw_dir, 'json');
-like_node($json, 'Foreign Scan', 'foreign scan node decoded');
-like($json, qr/"Extension Explain": /,
-	'foreign scan extension EXPLAIN text decoded');
+	$json = decode_dir($fdw_dir, 'json');
+	like_node($json, 'Foreign Scan', 'foreign scan node decoded');
+	like($json, qr/"Extension Explain": /,
+		'foreign scan extension EXPLAIN text decoded');
+}
+else
+{
+	note('file_fdw is not installed for this PostgreSQL build; skipping FDW runtime case');
+}
 
 $node->safe_psql(
 	'postgres',

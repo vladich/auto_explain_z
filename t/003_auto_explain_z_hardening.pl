@@ -4,21 +4,45 @@ use warnings FATAL => 'all';
 use Cwd qw(abs_path);
 use File::Basename qw(basename);
 use File::Copy qw(copy);
-use FindBin;
 use IPC::Run;
 use JSON::PP;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $decoder = "$FindBin::Bin/../auto_explain_z_dump";
+my $decoder = $ENV{AEZ_DUMP} // '';
+plan skip_all => "AEZ_DUMP not set" if $decoder eq '';
 plan skip_all => "auto_explain_z_dump not found" unless -x $decoder;
+my $module_dir = $ENV{AEZ_MODULE_DIR} // '';
+plan skip_all => "AEZ_MODULE_DIR not set" if $module_dir eq '';
 
 sub sql_string
 {
 	my ($value) = @_;
 	$value =~ s/'/''/g;
 	return "'$value'";
+}
+
+sub pg_version_num
+{
+	my $pg_config = $ENV{PG_CONFIG} // '';
+
+	return 0 if $pg_config eq '';
+	my ($version, $stderr) = run_command([ $pg_config, '--version' ]);
+	return $1 * 10000 if $version =~ /PostgreSQL\s+(\d+)/;
+	return 0;
+}
+
+sub pg_supports_extension_control_path
+{
+	my $pg_config = $ENV{PG_CONFIG} // '';
+
+	return 0 if $pg_config eq '';
+	my ($sharedir, $stderr) = run_command([ $pg_config, '--sharedir' ]);
+	chomp($sharedir);
+	return 1 if -f "$sharedir/postgresql.conf.sample" &&
+	  slurp_file("$sharedir/postgresql.conf.sample") =~ /extension_control_path/;
+	return 0;
 }
 
 sub aez_files
@@ -127,7 +151,8 @@ my $node = PostgreSQL::Test::Cluster->new('hardening');
 $node->init;
 
 my $data_dir = abs_path($node->data_dir);
-my $module_dir = "$FindBin::Bin/..";
+my $server_version_num = pg_version_num();
+my $has_extension_control_path = pg_supports_extension_control_path();
 my $extshare = "$data_dir/extshare";
 my $good_dir = "$data_dir/aez_good";
 my $manual_rotation_dir = "$data_dir/aez_manual_rotation";
@@ -137,20 +162,24 @@ my $template_dir = "$data_dir/aez_templates";
 my $multi_dir = "$data_dir/aez_multi";
 my $retention_dir = "$data_dir/aez_retention";
 
-mkdir $extshare;
-mkdir "$extshare/extension";
-copy("$module_dir/auto_explain_z.control",
-	"$extshare/extension/auto_explain_z.control")
-  or die "could not stage auto_explain_z.control: $!";
-copy("$module_dir/auto_explain_z--1.0.sql",
-	"$extshare/extension/auto_explain_z--1.0.sql")
-  or die "could not stage auto_explain_z--1.0.sql: $!";
+if ($has_extension_control_path)
+{
+	mkdir $extshare;
+	mkdir "$extshare/extension";
+	copy("$module_dir/auto_explain_z.control",
+		"$extshare/extension/auto_explain_z.control")
+	  or die "could not stage auto_explain_z.control: $!";
+	copy("$module_dir/auto_explain_z--1.0.sql",
+		"$extshare/extension/auto_explain_z--1.0.sql")
+	  or die "could not stage auto_explain_z--1.0.sql: $!";
+}
 
 $node->append_conf(
 	'postgresql.conf',
+	"dynamic_library_path = '$module_dir:\$libdir'\n" .
+	($has_extension_control_path ?
+		"extension_control_path = '$extshare:\$system'\n" : '') .
 	qq{
-dynamic_library_path = '$module_dir:\$libdir'
-extension_control_path = '$extshare:\$system'
 shared_preload_libraries = 'auto_explain_z'
 compute_query_id = on
 jit = off
@@ -159,13 +188,29 @@ auto_explain_z.compression = none
 });
 $node->start;
 
-my $extversion = $node->safe_psql(
-	'postgres',
-	q{
+if ($has_extension_control_path)
+{
+	my $extversion = $node->safe_psql(
+		'postgres',
+		q{
 CREATE EXTENSION auto_explain_z;
 SELECT extversion FROM pg_extension WHERE extname = 'auto_explain_z';
 });
-is($extversion, '1.0', 'CREATE EXTENSION auto_explain_z registers metadata');
+	is($extversion, '1.0', 'CREATE EXTENSION auto_explain_z registers metadata');
+}
+else
+{
+	$node->safe_psql(
+		'postgres',
+		q{
+CREATE FUNCTION auto_explain_z_rotate_logfile()
+RETURNS boolean
+AS 'auto_explain_z', 'auto_explain_z_rotate_logfile'
+LANGUAGE C STRICT;
+REVOKE EXECUTE ON FUNCTION auto_explain_z_rotate_logfile() FROM public;
+});
+	pass('auto_explain_z_rotate_logfile C function registered without extension_control_path');
+}
 my $rotate_acl = $node->safe_psql(
 	'postgres',
 	q{

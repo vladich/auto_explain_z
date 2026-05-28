@@ -374,33 +374,27 @@ def get_sharedir(pg_config):
     return None
 
 
-def extension_root(script):
-    path = Path(script).resolve()
-    if path.parent.name == "bench":
-        return path.parent.parent
-    return path.parent
+def extension_root(configured_root):
+    if not configured_root:
+        raise BenchError("AEZ_EXTENSION_ROOT is not set")
+    root = Path(configured_root).resolve()
+    if not (root / "auto_explain_z.c").exists():
+        raise BenchError(f"not an auto_explain_z checkout: {root}")
+    return root
 
 
-def postgres_source_root(script, configured_root):
-    if configured_root:
-        root = Path(configured_root).resolve()
-        if not (root / "src" / "backend" / "postgres").exists():
-            raise BenchError(f"not a PostgreSQL source tree: {root}")
-        return root
-
-    path = Path(script).resolve()
-    if path.parent.name == "bench":
-        path = path.parent.parent
-    else:
-        path = path.parent
-    if path.name == "auto_explain_z" and path.parent.name == "contrib":
-        return path.parent.parent
-    return None
+def postgres_source_root(configured_root):
+    if not configured_root:
+        return None
+    root = Path(configured_root).resolve()
+    if not (root / "src" / "backend" / "postgres").exists():
+        raise BenchError(f"not a PostgreSQL source tree: {root}")
+    return root
 
 
 def build_contrib(pg_root, aez_root, pg_config):
     if pg_root is None:
-        raise BenchError("--build-contrib requires --postgres-source for standalone runs")
+        raise BenchError("--build-contrib requires AEZ_POSTGRES_SOURCE or --postgres-source")
     run(["make", "-C", str(pg_root / "contrib" / "auto_explain")], capture=False)
     env = os.environ.copy()
     env["PG_CONFIG"] = pg_config
@@ -603,8 +597,8 @@ class Cluster:
 
     def dynamic_library_path(self):
         dirs = []
-        if self.pg_root is not None:
-            dirs.append(str(self.pg_root / "contrib" / "auto_explain"))
+        if self.args.auto_explain_library_dir:
+            dirs.append(self.args.auto_explain_library_dir)
         if self.aez_root is not None:
             dirs.append(str(self.aez_root))
         if self.args.dynamic_library_path:
@@ -1257,12 +1251,19 @@ def print_table(results):
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="Benchmark auto_explain versus auto_explain_z using pgbench")
-    parser.add_argument("--pg-config", default=shutil.which("pg_config") or "pg_config")
+    parser.add_argument("--pg-config",
+                        default=os.environ.get("AEZ_PG_CONFIG") or os.environ.get("PG_CONFIG") or "pg_config",
+                        help="pg_config program; defaults to AEZ_PG_CONFIG, PG_CONFIG, then pg_config in PATH")
+    parser.add_argument("--extension-root",
+                        default=os.environ.get("AEZ_EXTENSION_ROOT"),
+                        help="auto_explain_z checkout; defaults to AEZ_EXTENSION_ROOT")
     parser.add_argument("--postgres-source",
-                        help="PostgreSQL source tree for source-tree binaries and contrib/auto_explain")
+                        default=os.environ.get("AEZ_POSTGRES_SOURCE"),
+                        help="PostgreSQL source tree; defaults to AEZ_POSTGRES_SOURCE")
     parser.add_argument("--build-contrib", action="store_true",
-                        help="build contrib/auto_explain from --postgres-source and this auto_explain_z checkout first")
+                        help="build PostgreSQL auto_explain from AEZ_POSTGRES_SOURCE and this auto_explain_z checkout first")
     parser.add_argument("--workdir",
+                        default=os.environ.get("AEZ_BENCH_WORKDIR"),
                         help="directory for the temporary cluster and logs")
     parser.add_argument("--keep", action="store_true",
                         help="keep the generated workdir")
@@ -1316,9 +1317,14 @@ def parse_args(argv):
                         help="comma-separated auto_explain_z template-cache matrix: on,off")
     parser.add_argument("--max-templates", type=int, default=4096)
     parser.add_argument("--template-min-plan-bytes", type=int, default=0)
-    parser.add_argument("--dynamic-library-path")
+    parser.add_argument("--dynamic-library-path",
+                        default=os.environ.get("AEZ_DYNAMIC_LIBRARY_PATH"))
+    parser.add_argument("--auto-explain-library-dir",
+                        default=os.environ.get("AEZ_AUTO_EXPLAIN_LIBRARY_DIR"),
+                        help="directory containing an uninstalled auto_explain library")
     parser.add_argument("--share-dir",
-                        help="initdb input/share directory; useful for uninstalled source-tree runs")
+                        default=os.environ.get("AEZ_SHARE_DIR"),
+                        help="initdb input/share directory; defaults to AEZ_SHARE_DIR")
     parser.add_argument("--extra-server-option", action="append", default=[],
                         help="additional postgres -c key=value option")
     parser.add_argument("--start-timeout", type=int, default=30)
@@ -1343,8 +1349,8 @@ def apply_standard_matrix(args):
 def main(argv):
     args = parse_args(argv)
     apply_standard_matrix(args)
-    aez_root = extension_root(sys.argv[0])
-    pg_root = postgres_source_root(sys.argv[0], args.postgres_source)
+    aez_root = extension_root(args.extension_root)
+    pg_root = postgres_source_root(args.postgres_source)
     if args.build_contrib:
         build_contrib(pg_root, aez_root, args.pg_config)
 
@@ -1373,7 +1379,7 @@ def main(argv):
         work = Path(tempfile.mkdtemp(prefix="auto_explain_z_bench.")).resolve()
         cleanup = not args.keep
     paths["work"] = work
-    paths["sock"] = Path(tempfile.mkdtemp(prefix="aezsock.", dir="/tmp")).resolve()
+    paths["sock"] = Path(tempfile.mkdtemp(prefix="aezsock.")).resolve()
     if pg_root is not None and str(paths["initdb"]).startswith(str(pg_root)):
         paths.update(source_tree_bindir(paths, work, pg_root))
         paths["share"] = source_tree_sharedir(pg_root, work, sharedir)

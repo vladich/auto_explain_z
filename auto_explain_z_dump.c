@@ -23,6 +23,8 @@
 
 #include "pg_config.h"
 
+#include "auto_explain_z_format.h"
+
 #ifdef USE_LZ4
 #include <lz4.h>
 #include <lz4frame.h>
@@ -41,6 +43,9 @@
 #define COMPRESSION_NONE				0
 #define COMPRESSION_LZ4				1
 #define COMPRESSION_ZSTD				2
+
+#define FILE_FLAG_WAL_BUFFERS_FULL		0x0001
+#define FILE_FLAG_ACTUAL_ROWS_2_DECIMALS	0x0002
 
 #define PROFILE_SIMPLE				0
 #define PROFILE_FULL					1
@@ -279,7 +284,7 @@ static const char *profile_name(unsigned profile);
 static const char *template_mode_name(unsigned mode);
 static const char *relationship_name(unsigned rel);
 static const char *detail_label(unsigned code);
-static const char *node_name(unsigned tag);
+static const char *node_name(unsigned tag, int version);
 static bool detail_is_dynamic(unsigned code);
 
 static char *pg_timestamp_to_iso(int64_t ts);
@@ -309,7 +314,9 @@ static void parse_file_records(const char *path, Value *records);
 
 static Value *postgres_records(const Value *records);
 static Value *postgres_record(const Value *record);
-static Value *postgres_plan_node(const Value *node, uint32_t record_flags);
+static Value *postgres_plan_node(const Value *node, uint32_t record_flags,
+								 uint32_t pg_version,
+								 uint32_t file_flags);
 
 static void render_json_value(Buf *buf, const Value *value, int indent, const char *key);
 static void render_yaml_obj(Buf *buf, const Value *value, int indent);
@@ -1246,8 +1253,11 @@ detail_label(unsigned code)
 }
 
 static const char *
-node_name(unsigned tag)
+node_name(unsigned tag, int version)
 {
+	if (version >= 14)
+		return aez_plan_node_code_name(tag);
+
 	switch (tag)
 	{
 		case 331: return "Result";
@@ -1516,6 +1526,35 @@ pg_signed_i64(uint64_t value)
 	return (int64_t) value;
 }
 
+static uint32_t
+record_pg_version(const Value *record)
+{
+	Value	   *header;
+	Value	   *file;
+
+	header = object_get(record, "Record");
+	file = header ? object_get(header, "File") : NULL;
+	return (uint32_t) value_u64(object_get(file, "PostgreSQL Version"), 0);
+}
+
+static uint32_t
+record_file_flags(const Value *record)
+{
+	Value	   *header;
+	Value	   *file;
+
+	header = object_get(record, "Record");
+	file = header ? object_get(header, "File") : NULL;
+	return (uint32_t) value_u64(object_get(file, "File Flags"), 0);
+}
+
+static Value *
+postgres_actual_rows_value(double rows, uint32_t file_flags)
+{
+	return value_numeric(numeric_fixed(rows,
+									   (file_flags & FILE_FLAG_ACTUAL_ROWS_2_DECIMALS) ? 2 : 0));
+}
+
 static Value *
 parse_details(Reader *r)
 {
@@ -1665,7 +1704,7 @@ static Value *
 parse_full_plan_node(Reader *r)
 {
 	uint8_t		relationship = reader_u8(r);
-	uint16_t	node_tag = reader_u16(r);
+	uint16_t	node_tag = r->version >= 14 ? reader_u8(r) : reader_u16(r);
 	uint16_t	flags = reader_u16(r);
 	uint8_t		extra_kind = reader_u8(r);
 	uint64_t	extra1;
@@ -1675,7 +1714,7 @@ parse_full_plan_node(Reader *r)
 	Value	   *node = value_object();
 	Value	   *plans = value_array();
 	const char *relname = relationship_name(relationship);
-	const char *ntype = node_name(node_tag);
+	const char *ntype = node_name(node_tag, r->version);
 	Value	   *actual;
 
 	if (r->version >= 4)
@@ -1734,13 +1773,13 @@ parse_full_plan_node(Reader *r)
 static Value *
 parse_metric_node(Reader *r)
 {
-	uint16_t	node_tag = reader_u16(r);
+	uint16_t	node_tag = r->version >= 14 ? reader_u8(r) : reader_u16(r);
 	uint16_t	flags = reader_u16(r);
 	unsigned	width_code = 0;
 	unsigned	child_count_code = 0;
 	Value	   *node = value_object();
 	Value	   *plans = value_array();
-	const char *ntype = node_name(node_tag);
+	const char *ntype = node_name(node_tag, r->version);
 	Value	   *actual;
 
 	if (r->version >= 4)
@@ -2882,14 +2921,17 @@ add_buffer_properties(Value *out, const Value *buffers, bool include_io_timing)
 }
 
 static void
-add_wal_properties(Value *out, const Value *wal)
+add_wal_properties(Value *out, const Value *wal, uint32_t file_flags)
 {
 	static const char *order[] = {
-		"WAL Records", "WAL FPI", "WAL Bytes", "WAL Buffers Full",
+		"WAL Records", "WAL FPI", "WAL Bytes",
 	};
 
 	for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++)
 		object_set(out, order[i], value_int(value_i64(object_get(wal, order[i]), 0)));
+	if (file_flags & FILE_FLAG_WAL_BUFFERS_FULL)
+		object_set(out, "WAL Buffers Full",
+				   value_int(value_i64(object_get(wal, "WAL Buffers Full"), 0)));
 }
 
 static bool
@@ -3230,7 +3272,8 @@ skip_plan_key(const char *key)
 }
 
 static Value *
-postgres_plan_node(const Value *node, uint32_t record_flags)
+postgres_plan_node(const Value *node, uint32_t record_flags,
+				   uint32_t pg_version, uint32_t file_flags)
 {
 	char	   *json_name;
 	char	   *text_name;
@@ -3285,11 +3328,13 @@ postgres_plan_node(const Value *node, uint32_t record_flags)
 					   value_numeric(numeric_fixed(value_double_as(object_get(node, "Total Time"), 0), 3)));
 		}
 		object_set(out, "Actual Rows",
-				   value_numeric(numeric_fixed(value_double_as(object_get(node, "Actual Rows"), 0), 2)));
+				   postgres_actual_rows_value(value_double_as(object_get(node, "Actual Rows"), 0),
+											  file_flags));
 		object_set(out, "Actual Loops",
 				   value_int((int64_t) llround(value_double_as(object_get(node, "Actual Loops"), 0))));
 	}
-	object_set(out, "Disabled", value_bool((flags & NODE_DISABLED) != 0));
+	if (pg_version >= 180000)
+		object_set(out, "Disabled", value_bool((flags & NODE_DISABLED) != 0));
 	if (object_has(node, "Inner Unique"))
 		object_set(out, "Inner Unique", value_bool(value_truthy(object_get(node, "Inner Unique"))));
 
@@ -3349,7 +3394,7 @@ postgres_plan_node(const Value *node, uint32_t record_flags)
 	if (object_has(node, "Buffers"))
 		add_buffer_properties(out, object_get(node, "Buffers"), false);
 	if (object_has(node, "WAL"))
-		add_wal_properties(out, object_get(node, "WAL"));
+		add_wal_properties(out, object_get(node, "WAL"), file_flags);
 	if (subplans_removed)
 		object_set(out, "Subplans Removed", subplans_removed);
 	if (workers)
@@ -3368,7 +3413,9 @@ postgres_plan_node(const Value *node, uint32_t record_flags)
 		Value	   *plans = object_get(node, "Plans");
 
 		for (size_t i = 0; i < plans->v.a->len; i++)
-			array_append(children, postgres_plan_node(plans->v.a->items[i], record_flags));
+			array_append(children, postgres_plan_node(plans->v.a->items[i],
+													 record_flags, pg_version,
+													 file_flags));
 	}
 	if (array_len(children) > 0)
 		object_set(out, "Plans", children);
@@ -3380,13 +3427,16 @@ static Value *
 postgres_record(const Value *record)
 {
 	uint32_t	flags = (uint32_t) value_u64(object_get(record, "Flags"), 0);
+	uint32_t	pg_version = record_pg_version(record);
+	uint32_t	file_flags = record_file_flags(record);
 	Value	   *out = value_object();
 
 	if (value_truthy(object_get(record, "Query Text")))
 		object_set(out, "Query Text", value_copy(object_get(record, "Query Text")));
 	if (value_truthy(object_get(record, "Query Parameters")))
 		object_set(out, "Query Parameters", value_copy(object_get(record, "Query Parameters")));
-	object_set(out, "Plan", postgres_plan_node(object_get(record, "Plan"), flags));
+	object_set(out, "Plan", postgres_plan_node(object_get(record, "Plan"),
+											  flags, pg_version, file_flags));
 	if ((flags & FLAG_VERBOSE) && value_truthy(object_get(record, "Query Identifier")))
 		object_set(out, "Query Identifier",
 				   value_int(pg_signed_i64(value_u64(object_get(record, "Query Identifier"), 0))));
@@ -4226,7 +4276,7 @@ format_sampling_text(const Value *node)
 }
 
 static char *
-plan_line(const Value *node, bool timing)
+plan_line(const Value *node, bool timing, uint32_t file_flags)
 {
 	uint32_t	flags = (uint32_t) value_u64(object_get(node, "Flags"), 0);
 	char	   *json_name;
@@ -4234,6 +4284,8 @@ plan_line(const Value *node, bool timing)
 	Value	   *props;
 	Buf			buf;
 	const char *ntype = value_cstr(object_get(node, "Node Type"));
+	int			actual_rows_digits =
+		(file_flags & FILE_FLAG_ACTUAL_ROWS_2_DECIMALS) ? 2 : 0;
 
 	postgres_node_names(node, &json_name, &name, &props);
 	if (ntype && strcmp(ntype, "Custom Scan") == 0 &&
@@ -4407,13 +4459,15 @@ plan_line(const Value *node, bool timing)
 	if (object_has(node, "Actual Rows"))
 	{
 		if (timing)
-			buf_appendf(&buf, " (actual time=%.3f..%.3f rows=%.2f loops=%.0f)",
+			buf_appendf(&buf, " (actual time=%.3f..%.3f rows=%.*f loops=%.0f)",
 						value_double_as(object_get(node, "Startup Time"), 0),
 						value_double_as(object_get(node, "Total Time"), 0),
+						actual_rows_digits,
 						value_double_as(object_get(node, "Actual Rows"), 0),
 						value_double_as(object_get(node, "Actual Loops"), 0));
 		else
-			buf_appendf(&buf, " (actual rows=%.2f loops=%.0f)",
+			buf_appendf(&buf, " (actual rows=%.*f loops=%.0f)",
+						actual_rows_digits,
 						value_double_as(object_get(node, "Actual Rows"), 0),
 						value_double_as(object_get(node, "Actual Loops"), 0));
 	}
@@ -4445,7 +4499,8 @@ label_in_text_detail_order(const char *label)
 }
 
 static void
-render_plan_text(Buf *buf, const Value *node, uint32_t record_flags, int indent)
+render_plan_text(Buf *buf, const Value *node, uint32_t record_flags,
+				 uint32_t pg_version, uint32_t file_flags, int indent)
 {
 	static const char *detail_order[] = {
 		"Output", "Function Call", "Table Function Call", "Window",
@@ -4468,7 +4523,7 @@ render_plan_text(Buf *buf, const Value *node, uint32_t record_flags, int indent)
 	int			detail_indent = indent + (indent == 0 ? 2 : 6);
 	int			child_indent = detail_indent;
 	bool		timing = (record_flags & FLAG_TIMING) != 0;
-	char	   *line = plan_line(node, timing);
+	char	   *line = plan_line(node, timing, file_flags);
 	Buf			linebuf;
 
 	buf_init(&linebuf);
@@ -4710,10 +4765,12 @@ render_plan_text(Buf *buf, const Value *node, uint32_t record_flags, int indent)
 					buf_appendc(&l, ' ');
 				buf_appends(&l, value_cstr(object_get(child, "Subplan Name")));
 				append_line(buf, l.data);
-				render_plan_text(buf, child, record_flags, child_indent + 2);
+				render_plan_text(buf, child, record_flags, pg_version,
+								 file_flags, child_indent + 2);
 			}
 			else
-				render_plan_text(buf, child, record_flags, child_indent);
+				render_plan_text(buf, child, record_flags, pg_version,
+								 file_flags, child_indent);
 		}
 	}
 	(void) label_in_text_detail_order;
@@ -5056,6 +5113,8 @@ render_postgres_text(Buf *buf, const Value *records)
 	{
 		Value	   *rec = array_get(records, i);
 		uint32_t	flags = (uint32_t) value_u64(object_get(rec, "Flags"), 0);
+		uint32_t	pg_version = record_pg_version(rec);
+		uint32_t	file_flags = record_file_flags(rec);
 
 		if (i > 0)
 			buf_appends(buf, "\n\n");
@@ -5065,7 +5124,8 @@ render_postgres_text(Buf *buf, const Value *records)
 		if (value_truthy(object_get(rec, "Query Parameters")))
 			append_line(buf, xasprintf("Query Parameters: %s",
 									   value_cstr(object_get(rec, "Query Parameters"))));
-		render_plan_text(buf, object_get(rec, "Plan"), flags, 0);
+		render_plan_text(buf, object_get(rec, "Plan"), flags, pg_version,
+						 file_flags, 0);
 		if ((flags & FLAG_VERBOSE) && value_truthy(object_get(rec, "Query Identifier")))
 			append_line(buf, xasprintf("Query Identifier: %" PRId64,
 									   pg_signed_i64(value_u64(object_get(rec, "Query Identifier"), 0))));
@@ -5114,7 +5174,8 @@ render_raw_text(Buf *buf, const Value *records)
 			append_line(buf, xasprintf("Query Parameters: %s",
 									   value_cstr(object_get(rec, "Query Parameters"))));
 		render_plan_text(buf, object_get(rec, "Plan"),
-						 (uint32_t) value_u64(object_get(rec, "Flags"), 0), 0);
+						 (uint32_t) value_u64(object_get(rec, "Flags"), 0),
+						 record_pg_version(rec), record_file_flags(rec), 0);
 		if (object_has(rec, "Planning"))
 			render_planning_text(buf, object_get(rec, "Planning"));
 		if (object_has(rec, "Trigger"))

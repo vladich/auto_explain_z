@@ -13,7 +13,9 @@
 #include "postgres.h"
 
 #include "commands/explain.h"
+#ifdef AEZ_HAVE_EXPLAIN_SPLIT_HEADERS
 #include "commands/explain_format.h"
+#endif
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "nodes/extensible.h"
@@ -118,13 +120,17 @@ aez_testscan_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	path->path.parallel_safe = rel->consider_parallel;
 	path->path.parallel_workers = 0;
 	path->path.rows = 0;
+#if PG_VERSION_NUM >= 180000
 	path->path.disabled_nodes = 0;
+#endif
 	path->path.startup_cost = 0;
 	path->path.total_cost = 0;
 	path->path.pathkeys = NIL;
 	path->flags = 0;
 	path->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
 	path->custom_restrictinfo = NIL;
+#endif
 	path->custom_private = NIL;
 	path->methods = &aez_testscan_path_methods;
 
