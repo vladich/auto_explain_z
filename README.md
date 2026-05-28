@@ -57,7 +57,7 @@ CREATE EXTENSION auto_explain_z;
 ```
 
 `CREATE EXTENSION` loads the module in the current session and installs
-`auto_explain_z_rotate_logfile()`. For production logging, configure
+`auto_explain_z_rotate_logfile()`. Configure
 `shared_preload_libraries` and restart PostgreSQL.
 
 ## Quick Start
@@ -101,7 +101,7 @@ SELECT count(*) FROM pg_class;
 ```
 
 Manual `LOAD` is useful for development, but it does not use the shared
-single-log coordination path. Use `shared_preload_libraries` for production.
+single-log coordination path. Use `shared_preload_libraries` for regular usage.
 
 ## Configuration
 
