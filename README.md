@@ -9,6 +9,12 @@ off the regular log path, serializes common plan fields into compact binary
 records, optionally stores repeated plan shapes as templates, and compresses
 serialized data with a file-level compression setting.
 
+A typical templated and compressed execution plan takes from a few bytes to the
+low tens of bytes using ZSTD compression. LZ4 compression is, on average,
+1.5x - 2x less compact, but incurs slightly less CPU overhead. Typical CPU overhead 
+is less than 1%, and I/O overhead is ~30x-50x lower than that of the EXPLAIN
+text format and ~100x-200x lower than the JSON format.
+
 ## Highlights
 
 - Separate `.aez` binary logs; plan payloads are not written to regular
