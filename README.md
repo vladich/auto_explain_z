@@ -268,14 +268,11 @@ across backends under `auto_explain_z.max_templates`. Each file still contains
 the template definitions needed by its references, so decoding does not depend
 on another backend's private state or another log file.
 
-## Binary Format at a Glance
+## Binary Format
 
-The file is versioned at the file level. Internal records do not carry their
-own magic numbers or format versions.
-
-- File header: magic, format version, compression method, PostgreSQL version,
+- File header: magic number, format version, compression method, PostgreSQL version,
   postmaster start time, postmaster start epoch, and postmaster pid.
-- File body: serialized record data. In shared-log mode compression is applied
+- File body: serialized record data. In shared-log mode, compression is applied
   to flushed backend batches, not to individual records.
 - Record header: compact size-control bytes, implicit record number,
   timestamp delta, profile, query flags, optional query id, duration, and
